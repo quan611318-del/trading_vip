@@ -1,0 +1,5 @@
+numpy==1.26.4
+pandas
+requests==2.31.0
+websocket-client==1.8.0
+python-telegram-bot==20.3 
