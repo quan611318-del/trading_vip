@@ -676,24 +676,24 @@ def _interval_seconds(interval=None):
 class StrategyConfig:
     """Cấu hình chiến lược tối giản, bổ sung max_reverse_count."""
     DEFAULTS = {
-        'current_interval': '1m',
-        'signal_interval': '1m',
-        'timeframe_seconds': 60.0,
+        'current_interval': '15m',
+        'signal_interval': '15m',
+        'timeframe_seconds': 900.0,
         'volume_factor': 1.10,
         'range_factor': 1.10,
         'use_quote_volume': 1.0,
-        'strategy_tp_roi': 28.0,
-        'strategy_sl_roi': 12.0,
+        'strategy_tp_roi': 0.0,
+        'strategy_sl_roi': 0.0,
         'emergency_stop_roi': 0.0,
         'profit_protect_enabled': 1.0,
-        'profit_protect_start_roi': 14.0,
-        'profit_protect_pullback_roi': 6.0,
-        'max_reverse_count': 2,               # <<< MỚI: số lần đảo chiều tối đa liên tiếp
+        'profit_protect_start_roi': 50.0,
+        'profit_protect_pullback_roi': 30.0,
+        'max_reverse_count': 5,               # <<< MỚI: số lần đảo chiều tối đa liên tiếp
         'max_hold_seconds': 0,
         'low_volume_filter_enabled': 0.0,
         'min_24h_volume': 0.0,
-        'scan_top_coin_limit': 80,
-        'max_signal_eval_coins': 50,
+        'scan_top_coin_limit': 300,
+        'max_signal_eval_coins': 300,
         'min_coin_price': 0.0,
         'max_coin_price': 0.0,
         'min_24h_trade_count': 0,
@@ -702,7 +702,7 @@ class StrategyConfig:
         'min_allowed_leverage': 50,
         'max_abs_24h_change_pct': 0.0,
         'min_abs_24h_change_pct': 0.0,
-        'coin_cooldown_after_loss_sec': 180,
+        'coin_cooldown_after_loss_sec': 900,
         'max_consecutive_losses_before_pause': 999,
         'pause_after_loss_streak_sec': 0,
         'force_rest_signal_enabled': 0.0,
@@ -729,9 +729,9 @@ class StrategyConfig:
         'exit_taker_ratio_min': 0.0,
         'buy_taker_ratio_min': 0.0,
         'sell_taker_ratio_min': 0.0,
-        'compare_interval': '1m',
-        'market_interval': '1m',
-        'extreme_interval': '1m',
+        'compare_interval': '15m',
+        'market_interval': '15m',
+        'extreme_interval': '15m',
         'min_elapsed_seconds': 0.0,
     }
     INT_KEYS = {'max_reverse_count', 'max_hold_seconds', 'scan_top_coin_limit', 'max_signal_eval_coins', 'min_24h_trade_count', 'target_leverage', 'min_allowed_leverage', 'max_consecutive_losses_before_pause', 'coin_cooldown_after_loss_sec'}
@@ -2372,7 +2372,31 @@ class BaseBot:
 
                 result = place_order(symbol, side, qty, self.api_key, self.api_secret)
                 invalidate_position_cache(symbol, self.api_key)
-                if result and 'orderId' in result:
+
+                # ---- FIX: Kiểm tra kiểu của result ----
+                if result is None:
+                    self.log(f"❌ {symbol} - Không nhận được phản hồi từ Binance")
+                    self.stop_symbol(symbol, failed=True)
+                    return False
+
+                if isinstance(result, list):
+                    # Trường hợp Binance trả về danh sách (có thể là danh sách order cũ)
+                    self.log(f"⚠️ {symbol} - place_order trả về list: {result[:2]}... (có thể do lỗi)")
+                    # Thử lấy phần tử đầu nếu là list có 1 phần tử chứa dict
+                    if len(result) == 1 and isinstance(result[0], dict):
+                        result = result[0]
+                    else:
+                        error_msg = str(result)
+                        self.log(f"❌ {symbol} - Lỗi lệnh: {error_msg}")
+                        self.stop_symbol(symbol, failed=True)
+                        return False
+
+                if not isinstance(result, dict):
+                    self.log(f"❌ {symbol} - Phản hồi không phải dict: {type(result)} - {result}")
+                    self.stop_symbol(symbol, failed=True)
+                    return False
+
+                if 'orderId' in result:
                     executed_qty = float(result.get('executedQty') or result.get('origQty') or qty)
                     avg_price = float(result.get('avgPrice') or current_price)
                     if executed_qty <= 0:
@@ -2410,7 +2434,7 @@ class BaseBot:
                     self.log(message)
                     return True
                 else:
-                    error_msg = result.get('msg', 'Lỗi không xác định') if result else 'Không có phản hồi'
+                    error_msg = result.get('msg', 'Lỗi không xác định') if isinstance(result, dict) else str(result)
                     self.log(f"❌ {symbol} - Lỗi lệnh: {error_msg}")
                     self.stop_symbol(symbol, failed=True)
                     return False
@@ -2419,7 +2443,6 @@ class BaseBot:
                 self.log(f"❌ {symbol} - Lỗi mở vị thế: {str(e)}")
                 self.stop_symbol(symbol, failed=True)
                 return False
-
     def _check_margin_safety(self):
         try:
             margin_balance, maint_margin, ratio = get_margin_safety_info(self.api_key, self.api_secret)
