@@ -556,12 +556,13 @@ def get_total_and_available_balance(api_key, api_secret):
         url = f"https://fapi.binance.com/fapi/v2/account?{query}&signature={sig}"
         headers = {"X-MBX-APIKEY": api_key}
         data = binance_api_request(url, headers=headers)
-        if not data:
-            logger.error("❌ Không lấy được số dư từ Binance")
+        data = _as_first_dict(data)
+        if not isinstance(data, dict):
+            logger.error(f"❌ Phản hồi số dư không phải dict: {type(data).__name__} - {str(data)[:200]}")
             return None, None
         total_all = 0.0
         available_all = 0.0
-        for asset in data["assets"]:
+        for asset in data.get("assets", []):
             if asset["asset"] in ("USDT", "USDC"):
                 available_all += float(asset["availableBalance"])
                 total_all += float(asset["walletBalance"])
@@ -580,7 +581,9 @@ def get_margin_balance(api_key, api_secret):
         url = f"https://fapi.binance.com/fapi/v2/account?{query}&signature={sig}"
         headers = {"X-MBX-APIKEY": api_key}
         data = binance_api_request(url, headers=headers)
-        if not data:
+        data = _as_first_dict(data)
+        if not isinstance(data, dict):
+            logger.error(f"❌ Phản hồi account không phải dict: {type(data).__name__} - {str(data)[:200]}")
             return None
         margin_balance = float(data.get("totalMarginBalance", 0.0))
         logger.info(f"💰 Số dư ký quỹ: {margin_balance:.2f}")
@@ -598,8 +601,9 @@ def get_margin_safety_info(api_key, api_secret):
         url = f"https://fapi.binance.com/fapi/v2/account?{query}&signature={sig}"
         headers = {"X-MBX-APIKEY": api_key}
         data = binance_api_request(url, headers=headers)
-        if not data:
-            logger.error("❌ Không lấy được thông tin ký quỹ từ Binance")
+        data = _as_first_dict(data)
+        if not isinstance(data, dict):
+            logger.error(f"❌ Phản hồi thông tin ký quỹ không phải dict: {type(data).__name__} - {str(data)[:200]}")
             return None, None, None
         margin_balance = float(data.get("totalMarginBalance", 0.0))
         maint_margin = float(data.get("totalMaintMargin", 0.0))
@@ -672,6 +676,48 @@ def _normalize_interval(value):
 
 def _interval_seconds(interval=None):
     return float(_BINANCE_INTERVAL_SECONDS.get(_normalize_interval(interval), 60.0))
+
+
+def _as_candle_dict(candle, symbol=None, is_final=False, interval=None):
+    """Chuẩn hóa nến về dict để tránh lỗi: 'list' object has no attribute 'get'.
+    Binance REST kline trả về list, còn WebSocket nội bộ dùng dict.
+    """
+    try:
+        if candle is None:
+            return None
+        if isinstance(candle, dict):
+            return candle
+        if isinstance(candle, (list, tuple)) and len(candle) >= 7:
+            used_interval = _normalize_interval(interval or _STRATEGY_CONFIG.get('current_interval', '1m'))
+            return {
+                'symbol': str(symbol or '').upper(),
+                'interval': used_interval,
+                'open': float(candle[1]),
+                'high': float(candle[2]),
+                'low': float(candle[3]),
+                'close': float(candle[4]),
+                'volume': float(candle[5]),
+                'quote_volume': float(candle[7]) if len(candle) > 7 else float(candle[5]) * float(candle[4]),
+                'num_trades': int(float(candle[8])) if len(candle) > 8 else 0,
+                'taker_buy_base_volume': float(candle[9]) if len(candle) > 9 else 0.0,
+                'taker_buy_quote_volume': float(candle[10]) if len(candle) > 10 else 0.0,
+                'is_final': bool(is_final),
+                'time': int(candle[0]),
+                'close_time': int(candle[6]),
+                'update_ts': time.time(),
+            }
+    except Exception as e:
+        logger.warning(f"⚠️ Không chuẩn hóa được candle {symbol}: {e}")
+    return None
+
+
+def _as_first_dict(value):
+    """Chuẩn hóa phản hồi API về dict khi endpoint đôi lúc trả list chứa 1 dict."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+        return value[0]
+    return value
 
 class StrategyConfig:
     """Cấu hình chiến lược tối giản, bổ sung max_reverse_count."""
@@ -1950,7 +1996,11 @@ class BaseBot:
     def _on_kline_update(self, symbol, candle):
         if symbol not in self.symbol_data:
             return
+        candle = _as_candle_dict(candle, symbol=symbol, is_final=False)
+        if not candle:
+            return
         prev = candle.get('prev_for_signal') or (self.kline_manager.get_prev_candle(symbol) if self.kline_manager else {})
+        prev = _as_candle_dict(prev, symbol=symbol, is_final=True) or {}
         signal = self._compute_signal_from_candle(candle, prev or {}, None, recent_1m_history=[])
         self.realtime_signal[symbol] = signal
         self.last_signal_time[symbol] = time.time()
@@ -1984,6 +2034,10 @@ class BaseBot:
             candle = self.kline_manager.get_candle(symbol)
             prev = self.kline_manager.get_prev_candle(symbol)
 
+        # FIX: kline_manager/REST có thể trả nến dạng list. Chuẩn hóa trước khi gọi .get().
+        candle = _as_candle_dict(candle, symbol=symbol, is_final=False)
+        prev = _as_candle_dict(prev, symbol=symbol, is_final=True)
+
         now = time.time()
         ws_stale = True
         if candle and not candle.get('is_final', False):
@@ -1994,11 +2048,12 @@ class BaseBot:
         if force_rest or (not candle) or ws_stale:
             rest_candle, rest_prev, _rest_market, _ = _fetch_rest_1m15m_signal_data(symbol)
             if rest_candle:
-                candle, prev = rest_candle, rest_prev or {}
+                candle = _as_candle_dict(rest_candle, symbol=symbol, is_final=False)
+                prev = _as_candle_dict(rest_prev, symbol=symbol, is_final=True) or {}
                 if self.kline_manager:
-                    self.kline_manager.candle_data[symbol] = rest_candle
-                    if rest_prev:
-                        self.kline_manager.prev_candle_data[symbol] = rest_prev
+                    self.kline_manager.candle_data[symbol] = candle
+                    if prev:
+                        self.kline_manager.prev_candle_data[symbol] = prev
 
         if not candle:
             details = {'signal': None, 'score': 0, 'reason': 'missing_current_candle', 'is_spike': False}
@@ -2009,6 +2064,14 @@ class BaseBot:
             return details if return_details else None
 
         details = self._compute_signal_from_candle(candle, prev or {}, None, mode=mode, return_details=True, recent_1m_history=[])
+        # FIX: phòng trường hợp hàm tín hiệu cũ/trộn phiên bản trả về string/list thay vì dict.
+        if not isinstance(details, dict):
+            details = {
+                'signal': details if details in ('BUY', 'SELL') else None,
+                'score': 0,
+                'reason': f'invalid_signal_details_type:{type(details).__name__}',
+                'is_spike': False,
+            }
         signal = details.get('signal')
         details['source'] = 'REST' if force_rest or ws_stale else 'WS'
         details['quote_volume'] = _quote_volume_of(candle)
@@ -2440,6 +2503,7 @@ class BaseBot:
                     return False
 
             except Exception as e:
+                logger.error(f"❌ Traceback lỗi mở vị thế {symbol}:\n{traceback.format_exc()}")
                 self.log(f"❌ {symbol} - Lỗi mở vị thế: {str(e)}")
                 self.stop_symbol(symbol, failed=True)
                 return False
