@@ -256,6 +256,7 @@ def create_strategy_config_keyboard():
             [{"text": "✏️ Số coin biến động để quét"}, {"text": "✏️ Số coin chấm tín hiệu"}],
             [{"text": "✏️ Đòn bẩy yêu cầu"}],
             [{"text": "✏️ Hệ số volume"}, {"text": "✏️ Hệ số biên độ nến"}],
+            [{"text": "✏️ Biên độ nến trước tối thiểu"}],
             [{"text": "✏️ Dùng volume USDT"}],
             [{"text": "✏️ TP chiến lược"}, {"text": "✏️ SL chiến lược"}],
             [{"text": "✏️ Bảo vệ lợi nhuận"}, {"text": "✏️ ROI bắt đầu bảo vệ"}],
@@ -275,6 +276,7 @@ def create_strategy_value_keyboard():
             [{"text": "1m"}, {"text": "3m"}, {"text": "5m"}, {"text": "15m"}],
             [{"text": "20"}, {"text": "50"}, {"text": "80"}, {"text": "120"}],
             [{"text": "1.0"}, {"text": "1.1"}, {"text": "1.2"}, {"text": "1.5"}, {"text": "2.0"}],
+            [{"text": "0.02"}, {"text": "0.03"}, {"text": "0.05"}, {"text": "0.08"}, {"text": "0.10"}],
             [{"text": "0"}, {"text": "1"}, {"text": "2"}, {"text": "3"}, {"text": "5"}],  # cho max_reverse_count
             [{"text": "12"}, {"text": "18"}, {"text": "28"}, {"text": "38"}, {"text": "60"}],
             [{"text": "180"}, {"text": "300"}, {"text": "600"}, {"text": "900"}],
@@ -727,6 +729,7 @@ class StrategyConfig:
         'timeframe_seconds': 900.0,
         'volume_factor': 1.10,
         'range_factor': 1.10,
+        'min_prev_range_pct': 0.05,
         'use_quote_volume': 1.0,
         'strategy_tp_roi': 0.0,
         'strategy_sl_roi': 0.0,
@@ -844,6 +847,7 @@ def get_strategy_config_text():
         "⚡ <b>TÍN HIỆU VÀO LỆNH</b>\n"
         f"• Volume hiện tại ≥ volume nến đóng gần nhất × {float(c.get('volume_factor', 1.10)):.2f}.\n"
         f"• Biên độ nến hiện tại ≥ biên độ nến đóng gần nhất × {float(c.get('range_factor', 1.10)):.2f}.\n"
+        f"• Bỏ qua nếu biên độ nến đóng gần nhất < {float(c.get('min_prev_range_pct', 0.05)):.3f}%.\n"
         f"• Loại volume: {'quoteVolume USDT' if use_qv else 'base volume coin'}.\n"
         "• Nến hiện tại xanh → BUY. Nến hiện tại đỏ → SELL. Open = Close thì ép BUY.\n\n"
         "🪙 <b>CHỌN COIN</b>\n"
@@ -981,10 +985,24 @@ def _volatility_volume_range_signal(current_candle, prev_closed_candle=None, mod
         cfg = _STRATEGY_CONFIG.get_all()
         vol_factor = max(0.0, float(cfg.get('volume_factor', 1.10) or 0.0))
         range_factor = max(0.0, float(cfg.get('range_factor', 1.10) or 0.0))
+        # Chặn lỗi đảo chiều do nến trước quá bẹt: nếu prev_range quá nhỏ,
+        # điều kiện current_range >= prev_range * range_factor sẽ quá dễ đạt.
+        min_prev_range_pct = max(0.0, float(cfg.get('min_prev_range_pct', 0.05) or 0.0))
         curr_vol = float(_selected_volume_of(current_candle) or 0.0)
         prev_vol = float(_selected_volume_of(prev_closed_candle) or 0.0)
         curr_range = float(_range_pct_of(current_candle) or 0.0)
         prev_range = float(_range_pct_of(prev_closed_candle) or 0.0)
+
+        if min_prev_range_pct > 0 and prev_range < min_prev_range_pct:
+            o = _candle_open(current_candle)
+            c = _candle_close(current_candle)
+            signal = 'BUY' if c >= o else 'SELL'
+            reason = (
+                f"SKIP_FLAT_PREV_RANGE {signal} | "
+                f"prev_range={prev_range:.3f}% < min_prev_range={min_prev_range_pct:.3f}% | "
+                f"curr_range={curr_range:.3f}% | curr_vol={curr_vol:.0f} prev_vol={prev_vol:.0f}"
+            )
+            return None, 0.0, reason, False
 
         vol_need = prev_vol * vol_factor
         range_need = prev_range * range_factor
@@ -3163,6 +3181,7 @@ class BotManager:
             '✏️ Đòn bẩy yêu cầu': ('min_allowed_leverage', 'Chỉ đánh coin có bracket hỗ trợ ít nhất mức đòn bẩy này.'),
             '✏️ Hệ số volume': ('volume_factor', 'Volume hiện tại phải >= volume nến đóng gần nhất nhân hệ số này. Ví dụ 1.1, 1.2, 1.5.'),
             '✏️ Hệ số biên độ nến': ('range_factor', 'Biên độ hiện tại phải >= biên độ nến đóng gần nhất nhân hệ số này. Ví dụ 1.1, 1.2, 1.5.'),
+            '✏️ Biên độ nến trước tối thiểu': ('min_prev_range_pct', 'Bỏ qua tín hiệu nếu biên độ nến đóng gần nhất nhỏ hơn mức này (%). Ví dụ 0.03, 0.05, 0.08. Đặt 0 để tắt lọc.'),
             '✏️ Dùng volume USDT': ('use_quote_volume', '1 = dùng quoteVolume USDT, 0 = dùng base volume coin.'),
             '✏️ TP chiến lược': ('strategy_tp_roi', 'TP ROI dùng realtime, có thể chỉnh sau khi đã vào lệnh. 0 = tắt.'),
             '✏️ SL chiến lược': ('strategy_sl_roi', 'SL ROI dùng realtime, có thể chỉnh sau khi đã vào lệnh. 0 = tắt.'),
