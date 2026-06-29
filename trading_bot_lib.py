@@ -1,4 +1,3 @@
-
 import json
 import hmac
 import hashlib
@@ -266,16 +265,31 @@ def create_sl_keyboard():
         "resize_keyboard": True, "one_time_keyboard": True
     }
 
+# --- Cập nhật bàn phím chiến lược với nút bộ lọc ---
 def create_strategy_config_keyboard():
-    """Bàn phím chiến lược random: chỉ giữ TP/SL và bảo vệ lợi nhuận."""
+    """Bàn phím chiến lược random: TP/SL, bảo vệ lợi nhuận và bộ lọc coin."""
     return {
         "keyboard": [
             [{"text": "📊 Xem tham số chiến lược"}],
             [{"text": "✏️ TP chiến lược"}, {"text": "✏️ SL chiến lược"}],
             [{"text": "✏️ Bảo vệ lợi nhuận"}, {"text": "✏️ ROI bắt đầu bảo vệ"}],
             [{"text": "✏️ ROI tụt từ đỉnh để đóng"}],
+            [{"text": "⚙️ Bộ lọc coin (khối lượng, giá,...)"}],
             [{"text": "🔄 Reset chiến lược mặc định"}],
             [{"text": "🔙 Quay lại menu chính"}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+def create_filter_keyboard():
+    """Bàn phím cho các tham số bộ lọc coin."""
+    return {
+        "keyboard": [
+            [{"text": "✏️ Min 24h Vol (USDT)"}, {"text": "✏️ Min Price"}],
+            [{"text": "✏️ Max Price"}, {"text": "✏️ Min Trades"}],
+            [{"text": "✏️ Min Abs Change %"}, {"text": "✏️ Max Abs Change %"}],
+            [{"text": "🔙 Quay lại cấu hình chiến lược"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -759,7 +773,11 @@ class StrategyConfig:
         'extreme_interval': '15m',
         'min_elapsed_seconds': 0.0,
     }
-    INT_KEYS = {'max_reverse_count', 'scan_top_coin_limit', 'max_signal_eval_coins', 'min_24h_trade_count', 'target_leverage', 'min_allowed_leverage', 'max_consecutive_losses_before_pause', 'max_hold_seconds', 'coin_cooldown_after_loss_sec'}
+    # Thêm 'min_24h_trade_count' vào INT_KEYS
+    INT_KEYS = {'max_reverse_count', 'scan_top_coin_limit', 'max_signal_eval_coins',
+                'min_24h_trade_count', 'target_leverage', 'min_allowed_leverage',
+                'max_consecutive_losses_before_pause', 'max_hold_seconds',
+                'coin_cooldown_after_loss_sec'}
     STRING_KEYS = {'current_interval', 'signal_interval', 'compare_interval', 'market_interval', 'extreme_interval'}
 
     def __init__(self):
@@ -827,7 +845,12 @@ def get_strategy_config_text():
         f"• TP chiến lược: {tp:.1f}% ROI ({'TẮT' if tp <= 0 else 'BẬT'})\n"
         f"• SL chiến lược: {sl:.1f}% ROI ({'TẮT' if sl <= 0 else 'BẬT'})\n"
         f"• Bảo vệ lợi nhuận: {'BẬT' if protect_on else 'TẮT'} | bắt đầu {float(c.get('profit_protect_start_roi', 50.0)):.1f}% | tụt {float(c.get('profit_protect_pullback_roi', 30.0)):.1f}% thì đóng\n"
-        "• Đồng bộ vị thế thật Binance: BẬT trước khi xét TP/SL.\n"
+        "• Đồng bộ vị thế thật Binance: BẬT trước khi xét TP/SL.\n\n"
+        "⚙️ <b>BỘ LỌC COIN (khi tìm coin mới)</b>\n"
+        f"• Min 24h Volume (USDT): {float(c.get('min_24h_volume', 0.0)):.0f} (0=tắt)\n"
+        f"• Min Price: {float(c.get('min_coin_price', 0.0)):.4f} | Max Price: {float(c.get('max_coin_price', 0.0)):.4f}\n"
+        f"• Min Trades 24h: {int(float(c.get('min_24h_trade_count', 0)))} (0=tắt)\n"
+        f"• Min Abs Change %: {float(c.get('min_abs_24h_change_pct', 0.0)):.1f} | Max Abs Change %: {float(c.get('max_abs_24h_change_pct', 0.0)):.1f}\n"
     )
 
 def _clamp(value, lo=-1.0, hi=1.0):
@@ -1423,7 +1446,7 @@ class SmartCoinFinder:
             return 0.0
 
     def _coin_passes_filters(self, coin, book_map, lev_map, excluded_coins):
-        """Chỉ lọc thứ bắt buộc: active/blacklist/cooldown và đòn bẩy yêu cầu."""
+        """Lọc coin dựa trên đòn bẩy, blacklist, active, cooldown và các ngưỡng khối lượng/giá/biến động."""
         try:
             symbol = str(coin.get('symbol', '')).upper()
             if not symbol or symbol in _SYMBOL_BLACKLIST:
@@ -1444,6 +1467,37 @@ class SmartCoinFinder:
             min_lev = int(float(_STRATEGY_CONFIG.get('min_allowed_leverage', self.bot_leverage) or self.bot_leverage))
             if max_lev < min_lev:
                 return False, 'leverage_low', 0.0, 0.0, max_lev
+
+            # --- BỘ LỌC KHỐI LƯỢNG, GIÁ, GIAO DỊCH, BIẾN ĐỘNG ---
+            cfg = _STRATEGY_CONFIG.get_all()
+            min_vol = float(cfg.get('min_24h_volume', 0.0) or 0.0)
+            min_price = float(cfg.get('min_coin_price', 0.0) or 0.0)
+            max_price = float(cfg.get('max_coin_price', 0.0) or 0.0)
+            min_trades = int(float(cfg.get('min_24h_trade_count', 0) or 0))
+            min_abs_change = float(cfg.get('min_abs_24h_change_pct', 0.0) or 0.0)
+            max_abs_change = float(cfg.get('max_abs_24h_change_pct', 0.0) or 0.0)
+
+            quote_volume = float(coin.get('quote_volume', 0.0) or 0.0)
+            if min_vol > 0 and quote_volume < min_vol:
+                return False, 'volume_low', 0.0, 0.0, max_lev
+
+            price = float(coin.get('price', 0.0) or 0.0)
+            if min_price > 0 and price < min_price:
+                return False, 'price_low', 0.0, 0.0, max_lev
+            if max_price > 0 and price > max_price:
+                return False, 'price_high', 0.0, 0.0, max_lev
+
+            trades = int(float(coin.get('trade_count', 0) or 0))
+            if min_trades > 0 and trades < min_trades:
+                return False, 'trades_low', 0.0, 0.0, max_lev
+
+            change = float(coin.get('price_change_percent', 0.0) or 0.0)
+            abs_change = abs(change)
+            if min_abs_change > 0 and abs_change < min_abs_change:
+                return False, 'change_low', 0.0, 0.0, max_lev
+            if max_abs_change > 0 and abs_change > max_abs_change:
+                return False, 'change_high', 0.0, 0.0, max_lev
+            # --- KẾT THÚC BỘ LỌC ---
 
             base_score = self._base_coin_score(coin, 0.0, max_lev)
             return True, 'ok', base_score, 0.0, max_lev
@@ -3121,6 +3175,15 @@ class BotManager:
             '✏️ ROI tụt từ đỉnh để đóng': ('profit_protect_pullback_roi', 'Khi ROI tụt từ đỉnh xuống mức này thì đóng.'),
         }
 
+        filter_key_map = {
+            '✏️ Min 24h Vol (USDT)': 'min_24h_volume',
+            '✏️ Min Price': 'min_coin_price',
+            '✏️ Max Price': 'max_coin_price',
+            '✏️ Min Trades': 'min_24h_trade_count',
+            '✏️ Min Abs Change %': 'min_abs_24h_change_pct',
+            '✏️ Max Abs Change %': 'max_abs_24h_change_pct',
+        }
+
         if text == "📊 Danh sách Bot":
             if not self.bots:
                 send_telegram("🤖 Hiện không có bot nào đang chạy.", chat_id=chat_id,
@@ -3213,6 +3276,11 @@ class BotManager:
                 send_telegram("✅ Đã reset tham số chiến lược về mặc định.\n\n" + get_strategy_config_text(),
                              chat_id=chat_id, reply_markup=create_strategy_config_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            elif text == "⚙️ Bộ lọc coin (khối lượng, giá,...)":
+                self.user_states[chat_id] = {'step': 'waiting_filter_config'}
+                send_telegram("🔧 Chọn tham số bộ lọc coin để chỉnh sửa:", chat_id=chat_id,
+                             reply_markup=create_filter_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
             elif text in strategy_key_map:
                 key, help_text = strategy_key_map[text]
                 self.user_states[chat_id] = {'step': 'waiting_strategy_value', 'strategy_key': key}
@@ -3223,7 +3291,25 @@ class BotManager:
                 send_telegram("⚠️ Chọn tham số cần chỉnh.", chat_id=chat_id, reply_markup=create_strategy_config_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
 
-        elif current_step == 'waiting_strategy_value':
+        elif current_step == 'waiting_filter_config':
+            if text == "🔙 Quay lại cấu hình chiến lược":
+                self.user_states[chat_id] = {'step': 'waiting_strategy_config'}
+                send_telegram("🔙 Quay lại menu chiến lược.", chat_id=chat_id,
+                             reply_markup=create_strategy_config_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+                return
+            if text in filter_key_map:
+                key = filter_key_map[text]
+                self.user_states[chat_id] = {'step': 'waiting_filter_value', 'strategy_key': key}
+                send_telegram(f"✏️ Nhập giá trị mới cho <b>{key}</b> (0 = tắt lọc):", chat_id=chat_id,
+                             reply_markup=create_strategy_value_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            else:
+                send_telegram("⚠️ Chọn tham số cần chỉnh.", chat_id=chat_id,
+                             reply_markup=create_filter_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+
+        elif current_step in ('waiting_strategy_value', 'waiting_filter_value'):
             if text == "❌ Hủy bỏ":
                 self.user_states[chat_id] = {}
                 send_telegram("❌ Đã hủy.", chat_id=chat_id, reply_markup=create_main_menu(),
@@ -3238,6 +3324,7 @@ class BotManager:
                     _STRATEGY_CONFIG.update(**{key: val})
                 else:
                     val = float(text)
+                    # Các key thuộc INT_KEYS đã được khai báo trong StrategyConfig
                     int_keys = {'max_reverse_count', 'entry_min_trades', 'exit_min_trades', 'scan_top_coin_limit', 'confirm_min_trades', 'max_signal_eval_coins', 'min_24h_trade_count', 'target_leverage', 'min_allowed_leverage', 'max_consecutive_losses_before_pause', 'max_hold_seconds', 'coin_cooldown_after_loss_sec'}
                     if key in int_keys:
                         val = int(val)
@@ -3251,10 +3338,17 @@ class BotManager:
                         if key in ('max_buy_close_position', 'min_sell_close_position') and val > 1:
                             raise ValueError
                     _STRATEGY_CONFIG.update(**{key: val})
-                self.user_states[chat_id] = {'step': 'waiting_strategy_config'}
-                send_telegram("✅ Đã cập nhật.\n\n" + get_strategy_config_text(), chat_id=chat_id,
-                             reply_markup=create_strategy_config_keyboard(),
-                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+                # Quay lại menu tương ứng
+                if current_step == 'waiting_filter_value':
+                    self.user_states[chat_id] = {'step': 'waiting_filter_config'}
+                    send_telegram("✅ Đã cập nhật.\n\n" + get_strategy_config_text(), chat_id=chat_id,
+                                 reply_markup=create_filter_keyboard(),
+                                 bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+                else:
+                    self.user_states[chat_id] = {'step': 'waiting_strategy_config'}
+                    send_telegram("✅ Đã cập nhật.\n\n" + get_strategy_config_text(), chat_id=chat_id,
+                                 reply_markup=create_strategy_config_keyboard(),
+                                 bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
             except Exception:
                 send_telegram("⚠️ Giá trị không hợp lệ. Hãy nhập số phù hợp.", chat_id=chat_id,
                              reply_markup=create_strategy_value_keyboard(),
