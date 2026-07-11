@@ -1,76 +1,141 @@
-# main.py
-from trading_bot_lib import BotManager
-import os
-import json
-import time
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MAIN ENTRY POINT - Live Trading Bot
+====================================
+File này là đầu vào chính để chạy bot. Nó load biến môi trường từ .env,
+khởi tạo cấu hình, bắt tay với database và Binance, rồi chạy vòng lặp chính.
 
-# Lấy cấu hình từ biến môi trường
-BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', '')
-BINANCE_SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '')
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+Cách chạy:
+    python main.py
 
-# In ra để kiểm tra (không in secret key)
-print(f"BINANCE_API_KEY: {'***' if BINANCE_API_KEY else 'Không có'}")
-print(f"BINANCE_SECRET_KEY: {'***' if BINANCE_SECRET_KEY else 'Không có'}")
-print(f"TELEGRAM_BOT_TOKEN: {'***' if TELEGRAM_BOT_TOKEN else 'Không có'}")
-print(f"TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID else 'Không có'}")
+Các tham số dòng lệnh (tuỳ chọn):
+    --check-config   : Kiểm tra biến môi trường, không kết nối
+    --print-config   : In cấu hình (ẩn secret)
+    --init-db        : Chỉ tạo schema database, không chạy bot
+"""
 
-# Cấu hình bot từ biến môi trường (dạng JSON)
-bot_config_json = os.getenv('BOT_CONFIGS', '[]')
+import sys
+import logging
+import argparse
+import traceback
+
+# Thư viện dotenv để đọc file .env
 try:
-    BOT_CONFIGS = json.loads(bot_config_json)
-except Exception as e:
-    print(f"Lỗi phân tích cấu hình BOT_CONFIGS: {e}")
-    BOT_CONFIGS = []
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-def main():
-    # Kiểm tra cấu hình
-    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
-        print("❌ Chưa cấu hình API Key và Secret Key!")
-        return
-    
-    print("🟢 Đang khởi động hệ thống bot...")
-    
-    # Khởi tạo hệ thống
-    manager = BotManager(
-        api_key=BINANCE_API_KEY,
-        api_secret=BINANCE_SECRET_KEY,
-        telegram_bot_token=TELEGRAM_BOT_TOKEN,
-        telegram_chat_id=TELEGRAM_CHAT_ID
+# Import toàn bộ logic từ file chính
+# (Giả sử file logic được đặt cùng thư mục với tên trading_bot_live.py)
+from trading_bot_lib import (
+    BotConfig,
+    TradingBotApplication,
+    DatabaseManager,
+    install_signal_handlers,
+    logger,
+)
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="EMA + Volume LIVE TRADING PostgreSQL bot")
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Kiểm tra biến môi trường, không kết nối"
     )
-    
-    # Thêm các bot từ cấu hình
-    if BOT_CONFIGS:
-        print(f"🟢 Đang khởi động {len(BOT_CONFIGS)} bot từ cấu hình...")
-        for config in BOT_CONFIGS:
-            if len(config) >= 6:
-                symbol, lev, percent, tp, sl, strategy = config[0], config[1], config[2], config[3], config[4], config[5]
-                if manager.add_bot(symbol, lev, percent, tp, sl, strategy):
-                    print(f"✅ Bot {strategy} cho {symbol} khởi động thành công")
-                else:
-                    print(f"❌ Bot {strategy} cho {symbol} khởi động thất bại")
-    else:
-        print("⚠️ Không tìm thấy cấu hình bot! Vui lòng thiết lập biến môi trường BOT_CONFIGS.")
-    
+    parser.add_argument(
+        "--print-config",
+        action="store_true",
+        help="In cấu hình không chứa secret"
+    )
+    parser.add_argument(
+        "--init-db",
+        action="store_true",
+        help="Chỉ tạo/cập nhật schema PostgreSQL, không chạy bot"
+    )
+    return parser.parse_args()
+
+
+def run_check_config(config: BotConfig) -> int:
+    """Chỉ kiểm tra cấu hình, không kết nối gì."""
+    errors = config.validate(require_credentials=True)
+    if errors:
+        print("❌ CONFIG ERROR:")
+        for error in errors:
+            print(f"  - {error}")
+        return 2
+    print("✅ CONFIG OK")
+    return 0
+
+
+def run_init_db(config: BotConfig) -> int:
+    """Chỉ tạo schema database."""
+    errors = config.validate(require_credentials=False)
+    # Bỏ qua lỗi thiếu Binance API key khi chỉ init DB
+    errors = [e for e in errors if "BINANCE" not in e]
+    if errors:
+        print("❌ CONFIG ERROR:", "; ".join(errors))
+        return 2
     try:
-        print("🟢 Hệ thống đã sẵn sàng. Đang chạy...")
-        # Giữ chương trình chạy
-        while manager.running:
-            time.sleep(1)
-            
-    except KeyboardInterrupt:
-        print("\n👋 Nhận tín hiệu dừng từ người dùng...")
-        manager.log("👋 Nhận tín hiệu dừng từ người dùng...")
+        db = DatabaseManager(config)
+        db.connect_and_prepare()
+        print("✅ DATABASE SCHEMA OK")
+        return 0
     except Exception as e:
-        print(f"❌ LỖI HỆ THỐNG: {str(e)}")
-        manager.log(f"❌ LỖI HỆ THỐNG: {str(e)}")
-    finally:
-        manager.stop_all()
+        print(f"❌ Không thể tạo schema DB: {e}")
+        return 1
+
+
+def main() -> int:
+    # Load biến môi trường từ .env nếu có
+    load_dotenv()
+
+    # Parse tham số
+    args = parse_arguments()
+
+    # Tạo config từ env
+    config = BotConfig.from_env()
+
+    # Xử lý các lệnh đặc biệt
+    if args.print_config:
+        import json
+        print(json.dumps(config.public_dict(), ensure_ascii=False, indent=2, default=str))
+        return 0
+
+    if args.check_config:
+        return run_check_config(config)
+
+    if args.init_db:
+        return run_init_db(config)
+
+    # --- Chạy bot thực sự ---
+    logger.info("🚀 Khởi động Live Trading Bot...")
+    try:
+        app = TradingBotApplication(config)
+        install_signal_handlers(app)
+
+        # Khởi chạy vòng lặp chính
+        app.run_forever()
+        return 0
+
+    except KeyboardInterrupt:
+        logger.info("⏹️ Người dùng dừng bot (Ctrl+C).")
+        return 0
+
+    except Exception as exc:
+        logger.critical("❌ Bot gặp lỗi nghiêm trọng: %s", exc)
+        logger.critical(traceback.format_exc())
+        # Cố gắng gửi thông báo qua Telegram nếu có thể
+        try:
+            temp_app = TradingBotApplication(config)
+            temp_app.notify(f"❌ BOT CRASH: {exc}")
+            temp_app.shutdown()
+        except Exception:
+            pass
+        return 1
+
 
 if __name__ == "__main__":
-    main()
-
-
-
-
+    sys.exit(main())
