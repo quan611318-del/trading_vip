@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LIVE MERGED VERSION
-- Giữ nguyên live trading Binance Futures và giao diện Telegram của file gốc.
-- Port cấu hình/tín hiệu/risk/DCA/reverse/side-balance từ bản EMA-volume PostgreSQL.
-- Tín hiệu chính chỉ dùng nến đã đóng.
-- Lệnh đóng dùng reduceOnly để giảm nguy cơ vô tình đảo vị thế.
+BOT LIVE BINANCE FUTURES — EMA + VOLUME — RAILWAY POSTGRESQL
 
-CẢNH BÁO: File này CÓ THỂ ĐẶT LỆNH THẬT khi được cấp API key có quyền Futures.
+- Giữ nguyên live trading, Telegram và cơ chế đặt/đóng lệnh thật.
+- BUY và SELL có cấu hình TP, SL, DCA, bảo vệ lời, reverse, cân bằng và risk riêng.
+- DCA theo % giá đi sai so với GIÁ KHỚP GẦN NHẤT, không theo ROI cộng dồn.
+- PostgreSQL lưu cấu hình, trạng thái DCA/vị thế, event giao dịch và equity snapshot.
+- Advisory lock chặn hai Railway replica cùng OPEN/DCA.
+- Khi DB bắt buộc bị lỗi: chặn OPEN/DCA nhưng vẫn cho phép CLOSE để bảo vệ tài khoản.
+
+Cài thư viện:
+    pip install requests numpy websocket-client psycopg2-binary
+
+CẢNH BÁO: File này CÓ THỂ ĐẶT LỆNH THẬT khi API key có quyền Futures.
 """
 import json
 import hmac
@@ -22,11 +28,12 @@ import logging
 from logging.handlers import RotatingFileHandler
 import requests
 import os
+import signal as os_signal
 import math
 import traceback
 import random
 import queue
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 import ssl
@@ -34,6 +41,14 @@ import html
 import sys
 import gc
 from typing import Optional, List, Dict, Any, Tuple, Callable
+from pathlib import Path
+
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except Exception:
+    psycopg2 = None
 
 _BINANCE_LAST_REQUEST_TIME = 0
 _BINANCE_RATE_LOCK = threading.RLock()
@@ -179,6 +194,422 @@ def setup_logging():
     return logging.getLogger()
 
 logger = setup_logging()
+
+
+class RailwayPostgresStore:
+    """PostgreSQL storage and single-instance lock for the LIVE worker."""
+
+    def __init__(self):
+        self.url = os.getenv('DATABASE_URL', '').strip()
+        self.instance_name = os.getenv('BOT_INSTANCE_NAME', 'ema-volume-live-main').strip()
+        raw_required = os.getenv('REQUIRE_DATABASE_FOR_NEW_ORDERS')
+        self.required_for_new_orders = (
+            bool(self.url) if raw_required is None
+            else raw_required.strip().lower() in {'1', 'true', 'yes', 'on', 'y'}
+        )
+        self.fallback_path = Path(os.getenv('DB_FALLBACK_JOURNAL', 'db_fallback_events.jsonl'))
+        self.available = False
+        self.lock_acquired = False
+        self.last_error = ''
+        self._lock_conn = None
+        self._mutex = threading.RLock()
+        digest = hashlib.sha256(self.instance_name.encode('utf-8')).digest()[:8]
+        value = int.from_bytes(digest, 'big', signed=False)
+        self._lock_key = value - 2**64 if value >= 2**63 else value
+
+    @property
+    def configured(self):
+        return bool(self.url)
+
+    def _connect(self, autocommit=False):
+        if psycopg2 is None:
+            raise RuntimeError('Chưa cài psycopg2-binary')
+        if not self.url:
+            raise RuntimeError('Thiếu DATABASE_URL')
+        conn = psycopg2.connect(
+            self.url, connect_timeout=10,
+            application_name=self.instance_name,
+        )
+        conn.autocommit = autocommit
+        return conn
+
+    @staticmethod
+    def _json_param(value):
+        if psycopg2 is None:
+            return value
+        return psycopg2.extras.Json(
+            value, dumps=lambda obj: json.dumps(obj, ensure_ascii=False, default=str)
+        )
+
+    def _run(self, sql, params=(), fetch=None, required=False):
+        if not self.configured:
+            if required:
+                raise RuntimeError('DATABASE_URL chưa có')
+            return None
+        try:
+            conn = self._connect()
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(sql, params)
+                    result = cur.fetchone() if fetch == 'one' else cur.fetchall() if fetch == 'all' else None
+                conn.commit()
+                self.available = True
+                self.last_error = ''
+                return result
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        except Exception as exc:
+            self.available = False
+            self.last_error = str(exc)
+            if required:
+                raise
+            logger.error('PostgreSQL lỗi: %s', exc)
+            return None
+
+    def connect_and_prepare(self):
+        if not self.configured:
+            self.available = False
+            self.last_error = 'Thiếu DATABASE_URL'
+            logger.warning('DATABASE_URL chưa có: cấu hình và DCA không được lưu PostgreSQL')
+            return False
+        try:
+            statements = [
+                """
+                CREATE TABLE IF NOT EXISTS live_strategy_config(
+                    instance_name TEXT PRIMARY KEY,
+                    config_json JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS live_position_state(
+                    instance_name TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    bot_id TEXT,
+                    side TEXT CHECK(side IN ('BUY','SELL')),
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    leverage INTEGER NOT NULL DEFAULT 1,
+                    quantity NUMERIC NOT NULL DEFAULT 0,
+                    average_entry_price NUMERIC NOT NULL DEFAULT 0,
+                    initial_entry_price NUMERIC NOT NULL DEFAULT 0,
+                    initial_margin NUMERIC NOT NULL DEFAULT 0,
+                    current_margin NUMERIC NOT NULL DEFAULT 0,
+                    last_order_margin NUMERIC NOT NULL DEFAULT 0,
+                    dca_count INTEGER NOT NULL DEFAULT 0,
+                    last_dca_price NUMERIC NOT NULL DEFAULT 0,
+                    last_dca_at TIMESTAMPTZ,
+                    reverse_count INTEGER NOT NULL DEFAULT 0,
+                    metadata_json JSONB,
+                    opened_at TIMESTAMPTZ,
+                    closed_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY(instance_name, symbol)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS live_trade_events(
+                    id BIGSERIAL PRIMARY KEY,
+                    instance_name TEXT NOT NULL,
+                    bot_id TEXT,
+                    symbol TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    side TEXT,
+                    quantity NUMERIC,
+                    price NUMERIC,
+                    margin NUMERIC,
+                    notional NUMERIC,
+                    roi_pct NUMERIC,
+                    pnl NUMERIC,
+                    dca_step INTEGER,
+                    reason TEXT,
+                    order_id TEXT,
+                    raw_json JSONB,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS live_equity_snapshots(
+                    id BIGSERIAL PRIMARY KEY,
+                    instance_name TEXT NOT NULL,
+                    wallet_balance NUMERIC,
+                    available_balance NUMERIC,
+                    margin_balance NUMERIC,
+                    unrealized_pnl NUMERIC,
+                    long_notional NUMERIC,
+                    short_notional NUMERIC,
+                    total_notional NUMERIC,
+                    position_count INTEGER,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """,
+                "ALTER TABLE live_position_state ADD COLUMN IF NOT EXISTS last_order_margin NUMERIC NOT NULL DEFAULT 0",
+                "CREATE INDEX IF NOT EXISTS ix_live_events_symbol ON live_trade_events(instance_name,symbol,created_at)",
+                "CREATE INDEX IF NOT EXISTS ix_live_position_status ON live_position_state(instance_name,status)",
+            ]
+            conn = self._connect()
+            try:
+                with conn.cursor() as cur:
+                    for stmt in statements:
+                        cur.execute(stmt)
+                conn.commit()
+            finally:
+                conn.close()
+            self.available = True
+            self.last_error = ''
+            return self.acquire_instance_lock()
+        except Exception as exc:
+            self.available = False
+            self.last_error = str(exc)
+            logger.error('Không chuẩn bị được PostgreSQL: %s', exc)
+            return False
+
+    def acquire_instance_lock(self):
+        with self._mutex:
+            try:
+                if self._lock_conn is not None:
+                    try:
+                        with self._lock_conn.cursor() as cur:
+                            cur.execute('SELECT 1')
+                            cur.fetchone()
+                        self.lock_acquired = True
+                        return True
+                    except Exception:
+                        try:
+                            self._lock_conn.close()
+                        except Exception:
+                            pass
+                        self._lock_conn = None
+                        self.lock_acquired = False
+                conn = self._connect(autocommit=True)
+                with conn.cursor() as cur:
+                    cur.execute('SELECT pg_try_advisory_lock(%s)', (self._lock_key,))
+                    acquired = bool(cur.fetchone()[0])
+                if not acquired:
+                    conn.close()
+                    self.last_error = 'Một Railway replica khác đang giữ instance lock'
+                    self.lock_acquired = False
+                    return False
+                self._lock_conn = conn
+                self.lock_acquired = True
+                return True
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.available = False
+                self.lock_acquired = False
+                return False
+
+    def release_instance_lock(self):
+        with self._mutex:
+            conn, self._lock_conn = self._lock_conn, None
+            self.lock_acquired = False
+            if conn is None:
+                return
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT pg_advisory_unlock(%s)', (self._lock_key,))
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def ping(self, force=False):
+        if not self.configured:
+            return False
+        try:
+            conn = self._connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT 1')
+                    cur.fetchone()
+                conn.commit()
+            finally:
+                conn.close()
+            self.available = True
+            self.last_error = ''
+            if force or not self.lock_acquired:
+                self.acquire_instance_lock()
+            return True
+        except Exception as exc:
+            self.available = False
+            self.lock_acquired = False
+            self.last_error = str(exc)
+            return False
+
+    def ready_for_new_orders(self):
+        if not self.required_for_new_orders:
+            return True
+        if not self.configured:
+            self.last_error = 'DATABASE_URL bắt buộc nhưng chưa có'
+            return False
+        if not self.available and not self.ping(force=True):
+            return False
+        if not self.lock_acquired and not self.acquire_instance_lock():
+            return False
+        return True
+
+    def status_text(self):
+        if not self.configured:
+            return 'TẮT (thiếu DATABASE_URL)'
+        if self.available and self.lock_acquired:
+            return 'SẴN SÀNG + GIỮ INSTANCE LOCK'
+        if self.available:
+            return 'KẾT NỐI ĐƯỢC NHƯNG KHÔNG CÓ LOCK'
+        return f'LỖI: {self.last_error or "không rõ"}'
+
+    def save_config(self, config):
+        if not self.configured:
+            return not self.required_for_new_orders
+        try:
+            self._run(
+                """
+                INSERT INTO live_strategy_config(instance_name,config_json,updated_at)
+                VALUES(%s,%s,NOW())
+                ON CONFLICT(instance_name) DO UPDATE
+                SET config_json=EXCLUDED.config_json,updated_at=NOW()
+                """,
+                (self.instance_name, self._json_param(config)), required=True,
+            )
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+    def load_config(self):
+        row = self._run(
+            'SELECT config_json FROM live_strategy_config WHERE instance_name=%s',
+            (self.instance_name,), fetch='one', required=False,
+        )
+        return dict(row.get('config_json') or {}) if row else {}
+
+    def load_position(self, symbol):
+        row = self._run(
+            "SELECT * FROM live_position_state WHERE instance_name=%s AND symbol=%s AND status='OPEN'",
+            (self.instance_name, str(symbol).upper()), fetch='one', required=False,
+        )
+        return dict(row) if row else None
+
+    def save_position(self, bot_id, symbol, data, raw=None):
+        if not self.configured:
+            return not self.required_for_new_orders
+        try:
+            last_ts = float(data.get('last_dca_time', 0) or 0)
+            open_ts = float(data.get('opened_time', 0) or 0)
+            last_at = datetime.fromtimestamp(last_ts, tz=timezone.utc) if last_ts > 0 else None
+            opened_at = datetime.fromtimestamp(open_ts, tz=timezone.utc) if open_ts > 0 else None
+            self._run(
+                """
+                INSERT INTO live_position_state(
+                    instance_name,symbol,bot_id,side,status,leverage,quantity,
+                    average_entry_price,initial_entry_price,initial_margin,current_margin,last_order_margin,
+                    dca_count,last_dca_price,last_dca_at,reverse_count,metadata_json,
+                    opened_at,closed_at,updated_at
+                ) VALUES(%s,%s,%s,%s,'OPEN',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,NOW())
+                ON CONFLICT(instance_name,symbol) DO UPDATE SET
+                    bot_id=EXCLUDED.bot_id,side=EXCLUDED.side,status='OPEN',leverage=EXCLUDED.leverage,
+                    quantity=EXCLUDED.quantity,average_entry_price=EXCLUDED.average_entry_price,
+                    initial_entry_price=EXCLUDED.initial_entry_price,initial_margin=EXCLUDED.initial_margin,
+                    current_margin=EXCLUDED.current_margin,last_order_margin=EXCLUDED.last_order_margin,
+                    dca_count=EXCLUDED.dca_count,
+                    last_dca_price=EXCLUDED.last_dca_price,last_dca_at=EXCLUDED.last_dca_at,
+                    reverse_count=EXCLUDED.reverse_count,metadata_json=EXCLUDED.metadata_json,
+                    opened_at=CASE WHEN live_position_state.status='CLOSED' THEN EXCLUDED.opened_at
+                                   ELSE COALESCE(live_position_state.opened_at,EXCLUDED.opened_at) END,
+                    closed_at=NULL,updated_at=NOW()
+                """,
+                (
+                    self.instance_name, str(symbol).upper(), str(bot_id or ''), str(data.get('side') or ''),
+                    int(data.get('leverage', 1) or 1), float(data.get('qty', 0) or 0),
+                    float(data.get('entry', 0) or 0), float(data.get('initial_entry_price', data.get('entry', 0)) or 0),
+                    float(data.get('initial_margin', 0) or 0), float(data.get('current_margin', data.get('margin_used', 0)) or 0),
+                    float(data.get('last_order_margin', data.get('initial_margin', 0)) or 0),
+                    int(data.get('dca_count', 0) or 0), float(data.get('last_dca_price', 0) or 0),
+                    last_at, int(data.get('reverse_count', 0) or 0),
+                    self._json_param(raw if raw is not None else data), opened_at,
+                ), required=True,
+            )
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+    def mark_position_closed(self, symbol, raw=None):
+        if not self.configured:
+            return True
+        try:
+            self._run(
+                """
+                UPDATE live_position_state SET status='CLOSED',quantity=0,current_margin=0,last_order_margin=0,
+                    metadata_json=%s,closed_at=NOW(),updated_at=NOW()
+                WHERE instance_name=%s AND symbol=%s
+                """,
+                (self._json_param(raw), self.instance_name, str(symbol).upper()), required=True,
+            )
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
+
+    def _journal(self, event):
+        try:
+            self.fallback_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.fallback_path.open('a', encoding='utf-8') as fh:
+                fh.write(json.dumps({'time': datetime.now(timezone.utc).isoformat(), **event}, ensure_ascii=False, default=str) + '\n')
+        except Exception:
+            pass
+
+    def add_event(self, event_type, symbol, bot_id=None, side=None, quantity=None,
+                  price=None, margin=None, notional=None, roi_pct=None, pnl=None,
+                  dca_step=None, reason=None, order_id=None, raw=None, required=False):
+        event = dict(event_type=event_type, symbol=str(symbol).upper(), bot_id=bot_id, side=side,
+                     quantity=quantity, price=price, margin=margin, notional=notional,
+                     roi_pct=roi_pct, pnl=pnl, dca_step=dca_step, reason=reason,
+                     order_id=order_id, raw=raw)
+        if not self.configured:
+            self._journal(event)
+            return not required
+        try:
+            self._run(
+                """
+                INSERT INTO live_trade_events(
+                    instance_name,bot_id,symbol,event_type,side,quantity,price,margin,notional,
+                    roi_pct,pnl,dca_step,reason,order_id,raw_json
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (self.instance_name, str(bot_id or ''), str(symbol).upper(), event_type, side,
+                 quantity, price, margin, notional, roi_pct, pnl, dca_step, reason,
+                 order_id, self._json_param(raw)), required=required,
+            )
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            self._journal(event)
+            return False
+
+    def save_equity_snapshot(self, wallet, available, margin_balance, unrealized, exposure):
+        if not self.configured:
+            return False
+        self._run(
+            """
+            INSERT INTO live_equity_snapshots(
+                instance_name,wallet_balance,available_balance,margin_balance,unrealized_pnl,
+                long_notional,short_notional,total_notional,position_count
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (self.instance_name, wallet, available, margin_balance, unrealized,
+             float((exposure or {}).get('long_notional', 0) or 0),
+             float((exposure or {}).get('short_notional', 0) or 0),
+             float((exposure or {}).get('total_notional', 0) or 0),
+             int((exposure or {}).get('count', 0) or 0)), required=False,
+        )
+        return self.available
+
+
+_LIVE_DB = RailwayPostgresStore()
 
 
 _SIGNAL_DATA_CACHE = {}
@@ -359,20 +790,137 @@ def create_sl_keyboard():
 
 # --- Cập nhật bàn phím chiến lược với nút bộ lọc ---
 def create_strategy_config_keyboard():
-    """Bàn phím chiến lược: quản lý lệnh, tín hiệu BUY/SELL và bộ lọc coin."""
+    """Menu chiến lược chính: mỗi nhóm mở ra các tham số có thể chỉnh trực tiếp."""
     return {
         "keyboard": [
-            [{"text": "📊 Xem tham số chiến lược"}],
-            [{"text": "📡 Cấu hình tín hiệu BUY/SELL"}],
-            [{"text": "✏️ TP chiến lược"}, {"text": "✏️ SL chiến lược"}],
-            [{"text": "✏️ Bảo vệ lợi nhuận"}, {"text": "✏️ ROI bắt đầu bảo vệ"}],
-            [{"text": "✏️ ROI tụt từ đỉnh để đóng"}],
-            [{"text": "⚙️ Bộ lọc coin (khối lượng, giá,...)"}],
+            [{"text": "📊 Xem toàn bộ tham số"}],
+            [{"text": "📡 Tín hiệu BUY/SELL"}],
+            [{"text": "🛡️ Bảo vệ lợi nhuận"}],
+            [{"text": "🎯 TP/SL BUY/SELL"}],
+            [{"text": "➕ Nhồi lệnh BUY/SELL"}],
+            [{"text": "⚖️ Cân bằng BUY/SELL"}],
+            [{"text": "🔁 Thoát & đảo chiều BUY/SELL"}],
+            [{"text": "🔎 Lọc giá & coin"}],
+            [{"text": "🧱 Risk chung"}],
+            [{"text": "🗄️ Trạng thái Database"}],
             [{"text": "🔄 Reset chiến lược mặc định"}],
             [{"text": "🔙 Quay lại menu chính"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
+    }
+
+
+def create_profit_protect_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "✏️ Bảo vệ BUY bật/tắt"}, {"text": "✏️ Bảo vệ SELL bật/tắt"}],
+            [{"text": "✏️ ROI bắt đầu BUY"}, {"text": "✏️ ROI bắt đầu SELL"}],
+            [{"text": "✏️ Tụt đỉnh BUY"}, {"text": "✏️ Tụt đỉnh SELL"}],
+            [{"text": "🔙 Quay lại cấu hình chiến lược"}],
+        ],
+        "resize_keyboard": True, "one_time_keyboard": False,
+    }
+
+
+def create_tp_sl_config_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "✏️ TP BUY"}, {"text": "✏️ SL BUY"}, {"text": "✏️ Emergency BUY"}],
+            [{"text": "✏️ TP SELL"}, {"text": "✏️ SL SELL"}, {"text": "✏️ Emergency SELL"}],
+            [{"text": "✏️ Max giữ BUY"}, {"text": "✏️ Max giữ SELL"}],
+            [{"text": "🔙 Quay lại cấu hình chiến lược"}],
+        ],
+        "resize_keyboard": True, "one_time_keyboard": False,
+    }
+
+
+def create_dca_config_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "✏️ Nhồi BUY bật/tắt"}, {"text": "✏️ Nhồi SELL bật/tắt"}],
+            [{"text": "✏️ Giá ngược BUY %"}, {"text": "✏️ Giá ngược SELL %"}],
+            [{"text": "✏️ Hệ số vốn BUY"}, {"text": "✏️ Hệ số vốn SELL"}],
+            [{"text": "✏️ Số lần nhồi BUY"}, {"text": "✏️ Số lần nhồi SELL"}],
+            [{"text": "✏️ Giãn cách nhồi BUY"}, {"text": "✏️ Giãn cách nhồi SELL"}],
+            [{"text": "🔙 Quay lại cấu hình chiến lược"}],
+        ],
+        "resize_keyboard": True, "one_time_keyboard": False,
+    }
+
+
+def create_balance_config_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "✏️ Cân bằng BUY bật/tắt"}, {"text": "✏️ Cân bằng SELL bật/tắt"}],
+            [{"text": "✏️ Mode cân bằng BUY"}, {"text": "✏️ Mode cân bằng SELL"}],
+            [{"text": "✏️ Ngưỡng cân bằng BUY"}, {"text": "✏️ Ngưỡng cân bằng SELL"}],
+            [{"text": "✏️ Score override BUY"}, {"text": "✏️ Score override SELL"}],
+            [{"text": "✏️ Max vị thế BUY"}, {"text": "✏️ Max vị thế SELL"}],
+            [{"text": "✏️ Max notional BUY %"}, {"text": "✏️ Max notional SELL %"}],
+            [{"text": "✏️ Max margin/symbol BUY %"}, {"text": "✏️ Max margin/symbol SELL %"}],
+            [{"text": "🔙 Quay lại cấu hình chiến lược"}],
+        ],
+        "resize_keyboard": True, "one_time_keyboard": False,
+    }
+
+
+def create_reverse_config_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "✏️ Reverse mode BUY"}, {"text": "✏️ Reverse mode SELL"}],
+            [{"text": "✏️ Reverse score BUY"}, {"text": "✏️ Reverse score SELL"}],
+            [{"text": "✏️ Max reverse BUY"}, {"text": "✏️ Max reverse SELL"}],
+            [{"text": "✏️ Thoát ngược BUY bật/tắt"}, {"text": "✏️ Thoát ngược SELL bật/tắt"}],
+            [{"text": "✏️ Score thoát ngược BUY"}, {"text": "✏️ Score thoát ngược SELL"}],
+            [{"text": "🔙 Quay lại cấu hình chiến lược"}],
+        ],
+        "resize_keyboard": True, "one_time_keyboard": False,
+    }
+
+
+def create_management_value_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "0"}, {"text": "0.5"}, {"text": "1"}, {"text": "1.2"}],
+            [{"text": "1.5"}, {"text": "2"}, {"text": "3"}, {"text": "5"}],
+            [{"text": "10"}, {"text": "20"}, {"text": "30"}, {"text": "50"}],
+            [{"text": "100"}, {"text": "125"}, {"text": "200"}],
+            [{"text": "filter"}, {"text": "override"}],
+            [{"text": "none"}, {"text": "immediate"}, {"text": "confirmed"}],
+            [{"text": "❌ Hủy bỏ"}],
+        ],
+        "resize_keyboard": True, "one_time_keyboard": True,
+    }
+
+
+# Tên cũ giữ tương thích với trạng thái Telegram đang dở khi deploy lại.
+def create_side_management_keyboard(side):
+    return create_dca_config_keyboard()
+
+def create_global_risk_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "✏️ Bật/tắt giao dịch"}, {"text": "✏️ Max vị thế tổng"}],
+            [{"text": "✏️ Max notional tổng %"}, {"text": "✏️ Margin mode"}],
+            [{"text": "✏️ One-way mode"}],
+            [{"text": "✏️ Cooldown sau đóng"}, {"text": "✏️ Blacklist TP/SL"}],
+            [{"text": "🔙 Quay lại cấu hình chiến lược"}],
+        ],
+        "resize_keyboard": True, "one_time_keyboard": False,
+    }
+
+
+def create_global_value_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "0"}, {"text": "1"}, {"text": "2"}, {"text": "3"}],
+            [{"text": "5"}, {"text": "10"}, {"text": "20"}, {"text": "50"}],
+            [{"text": "100"}, {"text": "150"}, {"text": "300"}, {"text": "600"}],
+            [{"text": "ISOLATED"}, {"text": "CROSSED"}],
+            [{"text": "❌ Hủy bỏ"}],
+        ],
+        "resize_keyboard": True, "one_time_keyboard": True,
     }
 
 
@@ -411,12 +959,14 @@ def create_signal_value_keyboard():
 
 
 def create_filter_keyboard():
-    """Bàn phím cho các tham số bộ lọc coin."""
+    """Bộ lọc giá, thanh khoản và phạm vi scanner."""
     return {
         "keyboard": [
             [{"text": "✏️ Min 24h Vol (USDT)"}, {"text": "✏️ Min Price"}],
             [{"text": "✏️ Max Price"}, {"text": "✏️ Min Trades"}],
             [{"text": "✏️ Min Abs Change %"}, {"text": "✏️ Max Abs Change %"}],
+            [{"text": "✏️ Max Spread %"}],
+            [{"text": "✏️ Top coin quét"}, {"text": "✏️ Coin chấm tín hiệu"}],
             [{"text": "🔙 Quay lại cấu hình chiến lược"}],
         ],
         "resize_keyboard": True,
@@ -871,46 +1421,101 @@ class StrategyConfig:
         'buy_require_ema_trend': 1.0,
         'sell_require_ema_trend': 0.0,
 
-        # TP/SL riêng theo hướng (ROI margin sau đòn bẩy).
+        # Quản lý LONG và SHORT hoàn toàn tách riêng (ROI margin sau đòn bẩy).
         'long_tp_roi_pct': 125.0,
         'long_sl_roi_pct': 50.0,
         'short_tp_roi_pct': 100.0,
         'short_sl_roi_pct': 50.0,
+        'long_emergency_stop_roi_pct': 0.0,
+        'short_emergency_stop_roi_pct': 0.0,
+        'long_max_hold_seconds': 0,
+        'short_max_hold_seconds': 0,
+        # Alias cũ để state/Telegram cũ không lỗi.
         'strategy_tp_roi': 0.0,
         'strategy_sl_roi': 0.0,
         'emergency_stop_roi': 0.0,
 
-        # DCA LIVE.
+        # DCA LIVE theo % GIÁ đi sai so với giá khớp gần nhất.
+        # BUY: giá giảm trigger% từ last_dca_price. SELL: giá tăng trigger%.
         'enable_dca_long': 1.0,
         'enable_dca_short': 1.0,
+        'long_dca_trigger_price_pct': 1.0,
+        'short_dca_trigger_price_pct': 1.0,
+        # Mỗi lần nhồi lấy VỐN LẦN VÀO GẦN NHẤT × hệ số dưới đây.
+        # Ví dụ 1.5: vốn đầu 10 -> DCA1 15 -> DCA2 22.5 -> DCA3 33.75 USDT.
+        'long_dca_order_multiplier': 1.0,
+        'short_dca_order_multiplier': 1.0,
+        # Key cũ chỉ giữ để đọc cấu hình cũ; logic DCA mới không dùng chúng.
+        'long_dca_add_margin_pct': 100.0,
+        'short_dca_add_margin_pct': 100.0,
+        'long_dca_step_multiplier': 1.0,
+        'short_dca_step_multiplier': 1.0,
+        'long_max_dca_steps': 3,
+        'short_max_dca_steps': 3,
+        'long_dca_min_seconds_between_adds': 20,
+        'short_dca_min_seconds_between_adds': 20,
+        # Alias cũ; không còn dùng làm điều kiện chính.
         'dca_mode': 'loss',
         'dca_trigger_roi_pct': 25.0,
         'dca_multiplier': 1.10,
         'max_dca_steps': 3,
         'dca_min_seconds_between_adds': 20,
 
-        # Bảo vệ lợi nhuận.
+        # Bảo vệ lợi nhuận tách riêng.
+        'enable_profit_protect_long': 1.0,
+        'enable_profit_protect_short': 1.0,
+        'long_protect_start_roi_pct': 50.0,
+        'short_protect_start_roi_pct': 50.0,
+        'long_protect_pullback_roi_pct': 30.0,
+        'short_protect_pullback_roi_pct': 30.0,
+        # Alias cũ.
         'profit_protect_enabled': 1.0,
         'profit_protect_start_roi': 50.0,
         'profit_protect_pullback_roi': 30.0,
 
-        # Reverse và thoát bằng tín hiệu ngược.
-        'reverse_mode': 'confirmed',       # none | immediate | confirmed
+        # Reverse và thoát bằng tín hiệu ngược tách riêng theo vị thế cũ.
+        'long_reverse_mode': 'confirmed',
+        'short_reverse_mode': 'confirmed',
+        'long_reverse_min_score': 7.0,
+        'short_reverse_min_score': 7.0,
+        'long_max_reverse_count': 1,
+        'short_max_reverse_count': 1,
+        'long_enable_exit_on_opposite_signal': 0.0,
+        'short_enable_exit_on_opposite_signal': 0.0,
+        'long_opposite_exit_min_score': 7.0,
+        'short_opposite_exit_min_score': 7.0,
+        # Alias cũ.
+        'reverse_mode': 'confirmed',
         'reverse_min_score': 7.0,
         'max_reverse_count': 1,
         'enable_exit_on_opposite_signal': 0.0,
         'opposite_exit_min_score': 7.0,
 
-        # Cân bằng LONG/SHORT trên toàn tài khoản.
+        # Cân bằng exposure: cấu hình riêng khi hệ thống muốn ưu tiên BUY hoặc SELL.
+        'enable_side_balance_buy': 1.0,
+        'enable_side_balance_sell': 1.0,
+        'buy_side_balance_mode': 'filter',
+        'sell_side_balance_mode': 'filter',
+        'buy_side_balance_threshold': 1.25,
+        'sell_side_balance_threshold': 1.25,
+        'buy_balance_override_min_signal_score': 7.0,
+        'sell_balance_override_min_signal_score': 5.0,
+        # Alias cũ.
         'enable_side_balance': 1.0,
-        'side_balance_mode': 'override',   # filter | override
+        'side_balance_mode': 'filter',
         'side_balance_threshold': 1.25,
         'balance_override_min_signal_score': 3.0,
 
-        # Rủi ro tài khoản.
+        # Rủi ro tài khoản: có giới hạn tổng và giới hạn riêng BUY/SELL.
         'max_positions': 3,
+        'max_long_positions': 3,
+        'max_short_positions': 3,
+        'long_max_total_margin_per_symbol_pct': 4.0,
+        'short_max_total_margin_per_symbol_pct': 4.0,
         'max_total_margin_per_symbol_pct': 4.0,
         'max_total_notional_pct': 150.0,
+        'max_long_notional_pct': 100.0,
+        'max_short_notional_pct': 100.0,
         'max_daily_loss_pct': 0.0,
         'margin_type': 'ISOLATED',
         'ensure_one_way_mode': 1.0,
@@ -972,18 +1577,22 @@ class StrategyConfig:
     }
 
     INT_KEYS = {
-        'max_reverse_count', 'scan_top_coin_limit', 'max_signal_eval_coins',
-        'min_24h_trade_count', 'target_leverage', 'min_allowed_leverage',
-        'max_consecutive_losses_before_pause', 'max_hold_seconds',
+        'max_reverse_count', 'long_max_reverse_count', 'short_max_reverse_count',
+        'scan_top_coin_limit', 'max_signal_eval_coins', 'min_24h_trade_count',
+        'target_leverage', 'min_allowed_leverage', 'max_consecutive_losses_before_pause',
+        'max_hold_seconds', 'long_max_hold_seconds', 'short_max_hold_seconds',
         'coin_cooldown_after_loss_sec', 'ema_fast_period', 'ema_slow_period',
-        'signal_volume_lookback', 'max_positions', 'max_dca_steps',
-        'dca_min_seconds_between_adds', 'cooldown_after_close_seconds',
+        'signal_volume_lookback', 'max_positions', 'max_long_positions', 'max_short_positions',
+        'max_dca_steps', 'long_max_dca_steps', 'short_max_dca_steps',
+        'dca_min_seconds_between_adds', 'long_dca_min_seconds_between_adds',
+        'short_dca_min_seconds_between_adds', 'cooldown_after_close_seconds',
         'blacklist_after_tp_sl_seconds',
     }
     STRING_KEYS = {
         'current_interval', 'signal_interval', 'compare_interval', 'market_interval',
-        'extreme_interval', 'dca_mode', 'reverse_mode', 'side_balance_mode',
-        'margin_type', 'quote_asset',
+        'extreme_interval', 'dca_mode', 'reverse_mode', 'long_reverse_mode',
+        'short_reverse_mode', 'side_balance_mode', 'buy_side_balance_mode',
+        'sell_side_balance_mode', 'margin_type', 'quote_asset',
     }
 
     def __init__(self):
@@ -1053,23 +1662,46 @@ def _load_strategy_config_from_env():
         'BTC_CONTEXT_ENABLED': 'btc_context_enabled', 'BTC_BLOCK_BUY_DROP_PCT': 'btc_block_buy_drop_pct',
         'LONG_TP_ROI_PCT': 'long_tp_roi_pct', 'LONG_SL_ROI_PCT': 'long_sl_roi_pct',
         'SHORT_TP_ROI_PCT': 'short_tp_roi_pct', 'SHORT_SL_ROI_PCT': 'short_sl_roi_pct',
+        'LONG_EMERGENCY_STOP_ROI_PCT': 'long_emergency_stop_roi_pct',
+        'SHORT_EMERGENCY_STOP_ROI_PCT': 'short_emergency_stop_roi_pct',
+        'LONG_MAX_HOLD_SECONDS': 'long_max_hold_seconds', 'SHORT_MAX_HOLD_SECONDS': 'short_max_hold_seconds',
         'ENABLE_DCA_LONG': 'enable_dca_long', 'ENABLE_DCA_SHORT': 'enable_dca_short',
-        'DCA_MODE': 'dca_mode', 'DCA_TRIGGER_ROI_PCT': 'dca_trigger_roi_pct',
-        'DCA_MULTIPLIER': 'dca_multiplier', 'MAX_DCA_STEPS': 'max_dca_steps',
-        'DCA_MIN_SECONDS_BETWEEN_ADDS': 'dca_min_seconds_between_adds',
-        'ENABLE_PROFIT_PROTECT': 'profit_protect_enabled',
-        'PROTECT_START_ROI_PCT': 'profit_protect_start_roi',
-        'PROTECT_PULLBACK_ROI_PCT': 'profit_protect_pullback_roi',
-        'REVERSE_MODE': 'reverse_mode', 'REVERSE_MIN_SCORE': 'reverse_min_score',
-        'MAX_REVERSE_COUNT': 'max_reverse_count',
-        'ENABLE_EXIT_ON_OPPOSITE_SIGNAL': 'enable_exit_on_opposite_signal',
-        'OPPOSITE_EXIT_MIN_SCORE': 'opposite_exit_min_score',
-        'ENABLE_SIDE_BALANCE': 'enable_side_balance', 'SIDE_BALANCE_MODE': 'side_balance_mode',
-        'SIDE_BALANCE_THRESHOLD': 'side_balance_threshold',
-        'BALANCE_OVERRIDE_MIN_SIGNAL_SCORE': 'balance_override_min_signal_score',
-        'MAX_POSITIONS': 'max_positions',
-        'MAX_TOTAL_MARGIN_PER_SYMBOL_PCT': 'max_total_margin_per_symbol_pct',
+        'LONG_DCA_TRIGGER_PRICE_PCT': 'long_dca_trigger_price_pct',
+        'SHORT_DCA_TRIGGER_PRICE_PCT': 'short_dca_trigger_price_pct',
+        'LONG_DCA_ORDER_MULTIPLIER': 'long_dca_order_multiplier',
+        'SHORT_DCA_ORDER_MULTIPLIER': 'short_dca_order_multiplier',
+        'LONG_DCA_ADD_MARGIN_PCT': 'long_dca_add_margin_pct',
+        'SHORT_DCA_ADD_MARGIN_PCT': 'short_dca_add_margin_pct',
+        'LONG_DCA_STEP_MULTIPLIER': 'long_dca_step_multiplier',
+        'SHORT_DCA_STEP_MULTIPLIER': 'short_dca_step_multiplier',
+        'LONG_MAX_DCA_STEPS': 'long_max_dca_steps', 'SHORT_MAX_DCA_STEPS': 'short_max_dca_steps',
+        'LONG_DCA_MIN_SECONDS_BETWEEN_ADDS': 'long_dca_min_seconds_between_adds',
+        'SHORT_DCA_MIN_SECONDS_BETWEEN_ADDS': 'short_dca_min_seconds_between_adds',
+        'ENABLE_PROFIT_PROTECT_LONG': 'enable_profit_protect_long',
+        'ENABLE_PROFIT_PROTECT_SHORT': 'enable_profit_protect_short',
+        'LONG_PROTECT_START_ROI_PCT': 'long_protect_start_roi_pct',
+        'SHORT_PROTECT_START_ROI_PCT': 'short_protect_start_roi_pct',
+        'LONG_PROTECT_PULLBACK_ROI_PCT': 'long_protect_pullback_roi_pct',
+        'SHORT_PROTECT_PULLBACK_ROI_PCT': 'short_protect_pullback_roi_pct',
+        'LONG_REVERSE_MODE': 'long_reverse_mode', 'SHORT_REVERSE_MODE': 'short_reverse_mode',
+        'LONG_REVERSE_MIN_SCORE': 'long_reverse_min_score', 'SHORT_REVERSE_MIN_SCORE': 'short_reverse_min_score',
+        'LONG_MAX_REVERSE_COUNT': 'long_max_reverse_count', 'SHORT_MAX_REVERSE_COUNT': 'short_max_reverse_count',
+        'LONG_ENABLE_EXIT_ON_OPPOSITE_SIGNAL': 'long_enable_exit_on_opposite_signal',
+        'SHORT_ENABLE_EXIT_ON_OPPOSITE_SIGNAL': 'short_enable_exit_on_opposite_signal',
+        'LONG_OPPOSITE_EXIT_MIN_SCORE': 'long_opposite_exit_min_score',
+        'SHORT_OPPOSITE_EXIT_MIN_SCORE': 'short_opposite_exit_min_score',
+        'ENABLE_SIDE_BALANCE_BUY': 'enable_side_balance_buy', 'ENABLE_SIDE_BALANCE_SELL': 'enable_side_balance_sell',
+        'BUY_SIDE_BALANCE_MODE': 'buy_side_balance_mode', 'SELL_SIDE_BALANCE_MODE': 'sell_side_balance_mode',
+        'BUY_SIDE_BALANCE_THRESHOLD': 'buy_side_balance_threshold',
+        'SELL_SIDE_BALANCE_THRESHOLD': 'sell_side_balance_threshold',
+        'BUY_BALANCE_OVERRIDE_MIN_SIGNAL_SCORE': 'buy_balance_override_min_signal_score',
+        'SELL_BALANCE_OVERRIDE_MIN_SIGNAL_SCORE': 'sell_balance_override_min_signal_score',
+        'MAX_POSITIONS': 'max_positions', 'MAX_LONG_POSITIONS': 'max_long_positions',
+        'MAX_SHORT_POSITIONS': 'max_short_positions',
+        'LONG_MAX_TOTAL_MARGIN_PER_SYMBOL_PCT': 'long_max_total_margin_per_symbol_pct',
+        'SHORT_MAX_TOTAL_MARGIN_PER_SYMBOL_PCT': 'short_max_total_margin_per_symbol_pct',
         'MAX_TOTAL_NOTIONAL_PCT': 'max_total_notional_pct',
+        'MAX_LONG_NOTIONAL_PCT': 'max_long_notional_pct', 'MAX_SHORT_NOTIONAL_PCT': 'max_short_notional_pct',
         'MAX_DAILY_LOSS_PCT': 'max_daily_loss_pct', 'MARGIN_TYPE': 'margin_type',
         'ENSURE_ONE_WAY_MODE': 'ensure_one_way_mode', 'TRADING_ENABLED': 'trading_enabled',
         'QUOTE_ASSET': 'quote_asset', 'MIN_24H_QUOTE_VOLUME': 'min_24h_volume',
@@ -1083,8 +1715,10 @@ def _load_strategy_config_from_env():
     }
     bool_keys = {
         'btc_context_enabled', 'enable_dca_long', 'enable_dca_short',
-        'profit_protect_enabled', 'enable_exit_on_opposite_signal',
-        'enable_side_balance', 'ensure_one_way_mode', 'trading_enabled',
+        'enable_profit_protect_long', 'enable_profit_protect_short',
+        'long_enable_exit_on_opposite_signal', 'short_enable_exit_on_opposite_signal',
+        'enable_side_balance_buy', 'enable_side_balance_sell',
+        'ensure_one_way_mode', 'trading_enabled',
     }
     for env_name, key in mapping.items():
         raw = os.getenv(env_name)
@@ -1093,7 +1727,7 @@ def _load_strategy_config_from_env():
         try:
             if key in bool_keys:
                 value = 1.0 if raw.strip().lower() in {'1','true','yes','on','y','bat','bật'} else 0.0
-            elif key.endswith(('_tp_roi_pct', '_sl_roi_pct')) and raw.strip().lower() in {'none','null','off','false'}:
+            elif key.endswith(('_tp_roi_pct', '_sl_roi_pct', '_emergency_stop_roi_pct')) and raw.strip().lower() in {'none','null','off','false'}:
                 value = 0.0
             else:
                 value = raw
@@ -1105,23 +1739,145 @@ def _load_strategy_config_from_env():
 _load_strategy_config_from_env()
 
 
+def _initialize_strategy_database():
+    if not _LIVE_DB.connect_and_prepare():
+        return False
+    saved = _LIVE_DB.load_config()
+    if saved:
+        try:
+            _STRATEGY_CONFIG.update(**saved)
+            logger.info('✅ Đã nạp cấu hình chiến lược từ PostgreSQL Railway')
+        except Exception as exc:
+            logger.error(f'Lỗi nạp strategy config từ DB: {exc}')
+    else:
+        _LIVE_DB.save_config(_STRATEGY_CONFIG.get_all())
+    return True
+
+
+def _persist_strategy_config():
+    return _LIVE_DB.save_config(_STRATEGY_CONFIG.get_all())
+
+
+_initialize_strategy_database()
+
+
 
 def get_strategy_config_text():
     c = _STRATEGY_CONFIG.get_all()
     return (
-        "🎯 <b>LIVE EMA + VOLUME — NẾN ĐÃ ĐÓNG</b>\n\n"
-        f"• Khung {c.get('current_interval')} | EMA {int(c.get('ema_fast_period'))}/{int(c.get('ema_slow_period'))} | volume TB {int(c.get('signal_volume_lookback'))} nến\n"
-        f"• BUY: score≥{float(c.get('buy_score_threshold')):.2f}, gap≥{float(c.get('buy_min_score_gap')):.2f}, vol≥{float(c.get('buy_min_volume_ratio')):.2f}x, closePos≥{float(c.get('buy_min_close_position')):.2f}\n"
-        f"• SELL: score≥{float(c.get('sell_score_threshold')):.2f}, gap≥{float(c.get('sell_min_score_gap')):.2f}, vol≥{float(c.get('sell_min_volume_ratio')):.2f}x, closePos≤{float(c.get('sell_max_close_position')):.2f}\n"
-        f"• TP/SL LONG: {float(c.get('long_tp_roi_pct')):.1f}% / {float(c.get('long_sl_roi_pct')):.1f}% ROI\n"
-        f"• TP/SL SHORT: {float(c.get('short_tp_roi_pct')):.1f}% / {float(c.get('short_sl_roi_pct')):.1f}% ROI\n"
-        f"• DCA: {'BẬT' if float(c.get('enable_dca_long'))>=0.5 or float(c.get('enable_dca_short'))>=0.5 else 'TẮT'} | mode={c.get('dca_mode')} | trigger={float(c.get('dca_trigger_roi_pct')):.1f}% | ×{float(c.get('dca_multiplier')):.2f} | max {int(c.get('max_dca_steps'))}\n"
-        f"• Bảo vệ lời: {'BẬT' if float(c.get('profit_protect_enabled'))>=0.5 else 'TẮT'} từ {float(c.get('profit_protect_start_roi')):.1f}%, pullback {float(c.get('profit_protect_pullback_roi')):.1f}%\n"
-        f"• Reverse: {c.get('reverse_mode')} | min score {float(c.get('reverse_min_score')):.1f} | max {int(c.get('max_reverse_count'))}\n"
-        f"• Side balance: {c.get('side_balance_mode')} | tỷ lệ {float(c.get('side_balance_threshold')):.2f}\n"
-        f"• Risk: max positions={int(c.get('max_positions'))}, total notional≤{float(c.get('max_total_notional_pct')):.1f}% equity, margin/symbol≤{float(c.get('max_total_margin_per_symbol_pct')):.1f}%\n"
-        f"• Scanner: {c.get('quote_asset')} | min volume={float(c.get('min_24h_volume')):.0f} | top {int(c.get('scan_top_coin_limit'))}, evaluate {int(c.get('max_signal_eval_coins'))} | spread≤{float(c.get('max_spread_pct')):.2f}%\n"
+        "🎯 <b>CHIẾN LƯỢC LIVE — CHỈNH TRỰC TIẾP TRÊN TELEGRAM</b>\n\n"
+        f"📡 Tín hiệu: {c.get('current_interval')} | EMA {int(c.get('ema_fast_period'))}/{int(c.get('ema_slow_period'))} | BUY≥{float(c.get('buy_score_threshold')):.2f} | SELL≥{float(c.get('sell_score_threshold')):.2f}\n"
+        f"🎯 BUY TP/SL: {float(c.get('long_tp_roi_pct')):.2f}/{float(c.get('long_sl_roi_pct')):.2f}% ROI | SELL: {float(c.get('short_tp_roi_pct')):.2f}/{float(c.get('short_sl_roi_pct')):.2f}% ROI\n"
+        f"➕ Nhồi BUY: {'BẬT' if float(c.get('enable_dca_long')) >= .5 else 'TẮT'}, giá giảm {float(c.get('long_dca_trigger_price_pct')):.3f}%, vốn gần nhất ×{float(c.get('long_dca_order_multiplier')):.3f}, tối đa {int(c.get('long_max_dca_steps'))} lần\n"
+        f"➕ Nhồi SELL: {'BẬT' if float(c.get('enable_dca_short')) >= .5 else 'TẮT'}, giá tăng {float(c.get('short_dca_trigger_price_pct')):.3f}%, vốn gần nhất ×{float(c.get('short_dca_order_multiplier')):.3f}, tối đa {int(c.get('short_max_dca_steps'))} lần\n"
+        f"🛡️ Bảo vệ BUY/SELL: {'BẬT' if float(c.get('enable_profit_protect_long')) >= .5 else 'TẮT'}/{'BẬT' if float(c.get('enable_profit_protect_short')) >= .5 else 'TẮT'}\n"
+        f"🔎 Giá coin: {float(c.get('min_coin_price')):.8g} → {float(c.get('max_coin_price')):.8g} (0 = không giới hạn) | volume≥{float(c.get('min_24h_volume')):.0f}\n"
+        f"🗄️ PostgreSQL: {_LIVE_DB.status_text()}"
     )
+
+
+def get_profit_protect_text():
+    c = _STRATEGY_CONFIG.get_all()
+    return (
+        "🛡️ <b>BẢO VỆ LỢI NHUẬN RIÊNG BUY/SELL</b>\n\n"
+        f"🟢 BUY: {'BẬT' if float(c.get('enable_profit_protect_long')) >= .5 else 'TẮT'} | bắt đầu {float(c.get('long_protect_start_roi_pct')):.2f}% ROI | tụt từ đỉnh {float(c.get('long_protect_pullback_roi_pct')):.2f} điểm % thì đóng\n"
+        f"🔴 SELL: {'BẬT' if float(c.get('enable_profit_protect_short')) >= .5 else 'TẮT'} | bắt đầu {float(c.get('short_protect_start_roi_pct')):.2f}% ROI | tụt từ đỉnh {float(c.get('short_protect_pullback_roi_pct')):.2f} điểm % thì đóng"
+    )
+
+
+def get_tp_sl_config_text():
+    c = _STRATEGY_CONFIG.get_all()
+    return (
+        "🎯 <b>TP / SL RIÊNG BUY VÀ SELL</b>\n\n"
+        f"🟢 BUY: TP {float(c.get('long_tp_roi_pct')):.2f}% | SL {float(c.get('long_sl_roi_pct')):.2f}% | Emergency {float(c.get('long_emergency_stop_roi_pct')):.2f}% ROI | giữ tối đa {int(c.get('long_max_hold_seconds'))} giây\n"
+        f"🔴 SELL: TP {float(c.get('short_tp_roi_pct')):.2f}% | SL {float(c.get('short_sl_roi_pct')):.2f}% | Emergency {float(c.get('short_emergency_stop_roi_pct')):.2f}% ROI | giữ tối đa {int(c.get('short_max_hold_seconds'))} giây\n\n"
+        "0 = tắt riêng tham số đó. Thay đổi được áp dụng cho vị thế đang được bot quản lý."
+    )
+
+
+def get_dca_config_text():
+    c = _STRATEGY_CONFIG.get_all()
+    return (
+        "➕ <b>NHỒI LỆNH THEO GIÁ VÀ VỐN LẦN GẦN NHẤT</b>\n\n"
+        f"🟢 BUY: {'BẬT' if float(c.get('enable_dca_long')) >= .5 else 'TẮT'} | giá giảm {float(c.get('long_dca_trigger_price_pct')):.4f}% từ giá khớp gần nhất | vốn lần gần nhất ×{float(c.get('long_dca_order_multiplier')):.4f} | tối đa {int(c.get('long_max_dca_steps'))} lần | cách {int(c.get('long_dca_min_seconds_between_adds'))} giây\n"
+        f"🔴 SELL: {'BẬT' if float(c.get('enable_dca_short')) >= .5 else 'TẮT'} | giá tăng {float(c.get('short_dca_trigger_price_pct')):.4f}% từ giá khớp gần nhất | vốn lần gần nhất ×{float(c.get('short_dca_order_multiplier')):.4f} | tối đa {int(c.get('short_max_dca_steps'))} lần | cách {int(c.get('short_dca_min_seconds_between_adds'))} giây\n\n"
+        "Sau mỗi lần khớp, bot lưu giá khớp và vốn vừa nhồi làm mốc mới, đặt tiếp đúng hướng ban đầu và tăng DCA count."
+    )
+
+
+def get_balance_config_text():
+    c = _STRATEGY_CONFIG.get_all()
+    return (
+        "⚖️ <b>CÂN BẰNG VÀ GIỚI HẠN RIÊNG BUY/SELL</b>\n\n"
+        f"🟢 BUY: {'BẬT' if float(c.get('enable_side_balance_buy')) >= .5 else 'TẮT'} | {c.get('buy_side_balance_mode')} | ngưỡng {float(c.get('buy_side_balance_threshold')):.2f} | override score {float(c.get('buy_balance_override_min_signal_score')):.2f} | max {int(c.get('max_long_positions'))} vị thế / {float(c.get('max_long_notional_pct')):.2f}% notional / {float(c.get('long_max_total_margin_per_symbol_pct')):.2f}% margin mỗi coin\n"
+        f"🔴 SELL: {'BẬT' if float(c.get('enable_side_balance_sell')) >= .5 else 'TẮT'} | {c.get('sell_side_balance_mode')} | ngưỡng {float(c.get('sell_side_balance_threshold')):.2f} | override score {float(c.get('sell_balance_override_min_signal_score')):.2f} | max {int(c.get('max_short_positions'))} vị thế / {float(c.get('max_short_notional_pct')):.2f}% notional / {float(c.get('short_max_total_margin_per_symbol_pct')):.2f}% margin mỗi coin"
+    )
+
+
+def get_reverse_config_text():
+    c = _STRATEGY_CONFIG.get_all()
+    return (
+        "🔁 <b>THOÁT TÍN HIỆU NGƯỢC & ĐẢO CHIỀU</b>\n\n"
+        f"🟢 Vị thế BUY: reverse={c.get('long_reverse_mode')} | score SELL≥{float(c.get('long_reverse_min_score')):.2f} | tối đa {int(c.get('long_max_reverse_count'))} lần | thoát ngược {'BẬT' if float(c.get('long_enable_exit_on_opposite_signal')) >= .5 else 'TẮT'} tại score≥{float(c.get('long_opposite_exit_min_score')):.2f}\n"
+        f"🔴 Vị thế SELL: reverse={c.get('short_reverse_mode')} | score BUY≥{float(c.get('short_reverse_min_score')):.2f} | tối đa {int(c.get('short_max_reverse_count'))} lần | thoát ngược {'BẬT' if float(c.get('short_enable_exit_on_opposite_signal')) >= .5 else 'TẮT'} tại score≥{float(c.get('short_opposite_exit_min_score')):.2f}"
+    )
+
+
+def get_filter_config_text():
+    c = _STRATEGY_CONFIG.get_all()
+    return (
+        "🔎 <b>LỌC GIÁ VÀ COIN</b>\n\n"
+        f"• Giá: min {float(c.get('min_coin_price')):.8g} | max {float(c.get('max_coin_price')):.8g}\n"
+        f"• Volume 24h tối thiểu: {float(c.get('min_24h_volume')):.0f}\n"
+        f"• Số giao dịch 24h tối thiểu: {int(c.get('min_24h_trade_count'))}\n"
+        f"• Biến động tuyệt đối 24h: {float(c.get('min_abs_24h_change_pct')):.2f}% → {float(c.get('max_abs_24h_change_pct')):.2f}%\n"
+        f"• Spread tối đa: {float(c.get('max_spread_pct')):.4f}%\n"
+        f"• Top coin quét: {int(c.get('scan_top_coin_limit'))} | coin chấm tín hiệu: {int(c.get('max_signal_eval_coins'))}\n"
+        "0 = tắt giới hạn tương ứng, trừ số lượng coin quét."
+    )
+
+def get_global_risk_text():
+    c = _STRATEGY_CONFIG.get_all()
+    return (
+        "🛡️ <b>RISK CHUNG LIVE</b>\n\n"
+        f"• Giao dịch mới: {'BẬT' if float(c.get('trading_enabled', 1)) >= 0.5 else 'TẮT'}\n"
+        f"• Max vị thế tổng: {int(c.get('max_positions', 3))}\n"
+        f"• Max notional tổng: {float(c.get('max_total_notional_pct', 150)):.2f}% margin balance\n"
+        f"• Margin mode: {c.get('margin_type', 'ISOLATED')}\n"
+        f"• Ép One-way mode: {'CÓ' if float(c.get('ensure_one_way_mode', 1)) >= 0.5 else 'KHÔNG'}\n"
+        f"• Cooldown sau đóng: {int(c.get('cooldown_after_close_seconds', 60))} giây\n"
+        f"• Blacklist sau TP/SL: {int(c.get('blacklist_after_tp_sl_seconds', 180))} giây"
+    )
+
+
+def get_side_management_text(side):
+    c = _STRATEGY_CONFIG.get_all()
+    side = str(side).upper()
+    if side == 'BUY':
+        return f"""🟢 <b>CẤU HÌNH BUY/LONG</b>
+
+• TP/SL/Emergency: {float(c.get('long_tp_roi_pct')):.2f}% / {float(c.get('long_sl_roi_pct')):.2f}% / {float(c.get('long_emergency_stop_roi_pct')):.2f}% ROI
+• DCA: {'BẬT' if float(c.get('enable_dca_long'))>=0.5 else 'TẮT'}
+• Giá giảm từ lần khớp gần nhất: {float(c.get('long_dca_trigger_price_pct')):.4f}%
+• Lượng nhồi: {float(c.get('long_dca_add_margin_pct')):.2f}% margin lệnh đầu × {float(c.get('long_dca_step_multiplier')):.3f}^step
+• Tối đa {int(c.get('long_max_dca_steps'))} lần | cách nhau {int(c.get('long_dca_min_seconds_between_adds'))} giây
+• Bảo vệ lời: {'BẬT' if float(c.get('enable_profit_protect_long'))>=0.5 else 'TẮT'} từ {float(c.get('long_protect_start_roi_pct')):.2f}%, tụt {float(c.get('long_protect_pullback_roi_pct')):.2f}%
+• Reverse: {c.get('long_reverse_mode')} | score {float(c.get('long_reverse_min_score')):.2f} | max {int(c.get('long_max_reverse_count'))}
+• Thoát SELL ngược: {'BẬT' if float(c.get('long_enable_exit_on_opposite_signal'))>=0.5 else 'TẮT'} | score {float(c.get('long_opposite_exit_min_score')):.2f}
+• Cân bằng BUY: {'BẬT' if float(c.get('enable_side_balance_buy'))>=0.5 else 'TẮT'} | {c.get('buy_side_balance_mode')} | ratio {float(c.get('buy_side_balance_threshold')):.2f}
+• Giới hạn: {int(c.get('max_long_positions'))} vị thế | notional {float(c.get('max_long_notional_pct')):.2f}% | margin/symbol {float(c.get('long_max_total_margin_per_symbol_pct')):.2f}%"""
+    return f"""🔴 <b>CẤU HÌNH SELL/SHORT</b>
+
+• TP/SL/Emergency: {float(c.get('short_tp_roi_pct')):.2f}% / {float(c.get('short_sl_roi_pct')):.2f}% / {float(c.get('short_emergency_stop_roi_pct')):.2f}% ROI
+• DCA: {'BẬT' if float(c.get('enable_dca_short'))>=0.5 else 'TẮT'}
+• Giá tăng từ lần khớp gần nhất: {float(c.get('short_dca_trigger_price_pct')):.4f}%
+• Lượng nhồi: {float(c.get('short_dca_add_margin_pct')):.2f}% margin lệnh đầu × {float(c.get('short_dca_step_multiplier')):.3f}^step
+• Tối đa {int(c.get('short_max_dca_steps'))} lần | cách nhau {int(c.get('short_dca_min_seconds_between_adds'))} giây
+• Bảo vệ lời: {'BẬT' if float(c.get('enable_profit_protect_short'))>=0.5 else 'TẮT'} từ {float(c.get('short_protect_start_roi_pct')):.2f}%, tụt {float(c.get('short_protect_pullback_roi_pct')):.2f}%
+• Reverse: {c.get('short_reverse_mode')} | score {float(c.get('short_reverse_min_score')):.2f} | max {int(c.get('short_max_reverse_count'))}
+• Thoát BUY ngược: {'BẬT' if float(c.get('short_enable_exit_on_opposite_signal'))>=0.5 else 'TẮT'} | score {float(c.get('short_opposite_exit_min_score')):.2f}
+• Cân bằng SELL: {'BẬT' if float(c.get('enable_side_balance_sell'))>=0.5 else 'TẮT'} | {c.get('sell_side_balance_mode')} | ratio {float(c.get('sell_side_balance_threshold')):.2f}
+• Giới hạn: {int(c.get('max_short_positions'))} vị thế | notional {float(c.get('max_short_notional_pct')):.2f}% | margin/symbol {float(c.get('short_max_total_margin_per_symbol_pct')):.2f}%"""
 
 
 def _clamp(value, lo=-1.0, hi=1.0):
@@ -2412,7 +3168,8 @@ class BaseBot:
         self.coin_finder = SmartCoinFinder(api_key, api_secret)
         self.coin_finder.bot_leverage = self.lev
 
-        self.find_new_bot_after_close = True
+        self.find_new_bot_after_close = bool(kwargs.get('auto_search_when_empty', True))
+        self.monitor_existing_only = bool(kwargs.get('monitor_existing_only', False))
         self.bot_creation_time = time.time()
 
         self.execution_lock = threading.RLock()
@@ -2453,11 +3210,15 @@ class BaseBot:
         self.thread = threading.Thread(target=self._run, daemon=True, name=f"bot-{self.bot_id[-8:]}")
         self.thread.start()
 
-        strategy_tp = float(_STRATEGY_CONFIG.get('strategy_tp_roi', 0.0) or 0.0)
-        strategy_sl = float(_STRATEGY_CONFIG.get('strategy_sl_roi', 0.0) or 0.0)
-        tp_sl_info = f" | TP chiến lược: {strategy_tp}%" if strategy_tp > 0 else (f" | TP bot: {self.tp}%" if self.tp else " | TP: Tắt")
-        tp_sl_info += f" | SL chiến lược: {strategy_sl}%" if strategy_sl > 0 else (f" | SL bot: {self.sl}%" if self.sl else " | SL: Tắt")
-        self.log(f"🟢 Bot {strategy_name} đã khởi động | 1 coin | Đòn bẩy: {lev}x | Vốn: {percent}% | Tín hiệu: NẾN TƯƠNG ĐỐI | Thoát: TP/SL + bảo vệ lợi nhuận{tp_sl_info}")
+        long_tp = float(_STRATEGY_CONFIG.get('long_tp_roi_pct', 0) or 0)
+        long_sl = float(_STRATEGY_CONFIG.get('long_sl_roi_pct', 0) or 0)
+        short_tp = float(_STRATEGY_CONFIG.get('short_tp_roi_pct', 0) or 0)
+        short_sl = float(_STRATEGY_CONFIG.get('short_sl_roi_pct', 0) or 0)
+        self.log(
+            f"🟢 Bot {strategy_name} đã khởi động | Đòn bẩy {lev}x | Vốn lệnh đầu {percent}% | "
+            f"BUY TP/SL={long_tp or 'Tắt'}/{long_sl or 'Tắt'} | "
+            f"SELL TP/SL={short_tp or 'Tắt'}/{short_sl or 'Tắt'} | DCA/Reverse/Cân bằng chỉnh trên Telegram"
+        )
 
     def _run(self):
         last_coin_search_log = 0
@@ -2483,6 +3244,10 @@ class BaseBot:
                         continue
 
                 if not self.active_symbols:
+                    if not self.find_new_bot_after_close:
+                        self.status = 'monitoring_complete'
+                        time.sleep(2)
+                        continue
                     search_permission = self.bot_coordinator.request_coin_search(self.bot_id)
 
                     if search_permission:
@@ -2544,6 +3309,10 @@ class BaseBot:
                 return False
             data = self.symbol_data[symbol]
             current_time = time.time()
+            if self.monitor_existing_only and not data.get('position_open'):
+                self.log(f'✅ Vị thế khôi phục {symbol} đã đóng; dừng bot giám sát, không mở lệnh mới')
+                self.stop_symbol(symbol, failed=False)
+                return False
             if not data['position_open'] and current_time - data.get('added_time', current_time) > 300:
                 self.log(f"⏰ {symbol} chờ tín hiệu quá 5 phút, đổi coin")
                 self.stop_symbol(symbol, failed=True)
@@ -2589,7 +3358,8 @@ class BaseBot:
             'last_trade_time': 0.0, 'last_close_time': 0.0,
             'last_position_check': 0.0, 'last_position_api_sync': 0.0,
             'failed_attempts': 0, 'margin_used': 0.0,
-            'initial_margin': 0.0, 'current_margin': 0.0,
+            'initial_margin': 0.0, 'current_margin': 0.0, 'last_order_margin': 0.0,
+            'initial_entry_price': 0.0, 'last_dca_price': 0.0,
             'dca_count': 0, 'last_dca_time': 0.0,
             'reverse_count': 0, 'best_roi': None, 'worst_roi': None,
             'opened_time': 0.0, 'order_busy': False,
@@ -2601,7 +3371,53 @@ class BaseBot:
         if self.kline_manager:
             self.kline_manager.add_symbol(symbol, self._on_kline_update)
         self.coin_manager.register_coin(symbol)
-        self.log(f"➕ Đã thêm {symbol}; chờ tín hiệu từ NẾN ĐÃ ĐÓNG")
+        self._restore_live_position_state(symbol)
+        if self.symbol_data.get(symbol, {}).get('position_open'):
+            self.log(f"♻️ Đã khôi phục vị thế LIVE {symbol} từ Binance + PostgreSQL")
+        else:
+            self.log(f"➕ Đã thêm {symbol}; chờ tín hiệu từ NẾN ĐÃ ĐÓNG")
+
+    def _restore_live_position_state(self, symbol):
+        """Khôi phục metadata DCA từ DB, nhưng Binance luôn là nguồn vị thế thật."""
+        if symbol not in self.symbol_data:
+            return False
+        data = self.symbol_data[symbol]
+        db_state = _LIVE_DB.load_position(symbol) if _LIVE_DB.configured else None
+        try:
+            ok, pos = get_position_strict(symbol, self.api_key, self.api_secret)
+            if not ok:
+                return False
+            amt = float((pos or {}).get('positionAmt', 0) or 0)
+            if abs(amt) <= 0:
+                if db_state:
+                    _LIVE_DB.mark_position_closed(symbol, raw={'reason': 'BINANCE_POSITION_ZERO_ON_RESTORE'})
+                return False
+            side = 'BUY' if amt > 0 else 'SELL'
+            entry = float((pos or {}).get('entryPrice', 0) or 0)
+            lev = int(float((pos or {}).get('leverage', self.lev) or self.lev))
+            inferred_margin = abs(amt) * entry / max(float(lev), 1.0)
+            last_dca_at = (db_state or {}).get('last_dca_at')
+            opened_at = (db_state or {}).get('opened_at')
+            data.update({
+                'position_open': True, 'entry': entry, 'entry_base': entry,
+                'initial_entry_price': float((db_state or {}).get('initial_entry_price', 0) or entry),
+                'last_dca_price': float((db_state or {}).get('last_dca_price', 0) or entry),
+                'qty': amt, 'side': side, 'status': 'open', 'leverage': lev,
+                'initial_margin': float((db_state or {}).get('initial_margin', 0) or inferred_margin),
+                'current_margin': float((db_state or {}).get('current_margin', 0) or inferred_margin),
+                'last_order_margin': float((db_state or {}).get('last_order_margin', 0) or (db_state or {}).get('initial_margin', 0) or inferred_margin),
+                'margin_used': float((db_state or {}).get('current_margin', 0) or inferred_margin),
+                'dca_count': int((db_state or {}).get('dca_count', 0) or 0),
+                'reverse_count': int((db_state or {}).get('reverse_count', 0) or 0),
+                'last_dca_time': float(last_dca_at.timestamp()) if last_dca_at else 0.0,
+                'opened_time': float(opened_at.timestamp()) if opened_at else time.time(),
+                'best_roi': None, 'worst_roi': None,
+            })
+            _LIVE_DB.save_position(self.bot_id, symbol, data, raw={'binance_position': pos})
+            return True
+        except Exception as exc:
+            logger.error(f'Lỗi khôi phục vị thế {symbol}: {exc}')
+            return False
 
     def _handle_price_update(self, symbol, price):
         if symbol not in self.symbol_data:
@@ -2791,66 +3607,63 @@ class BaseBot:
         if current_price <= 0:
             return
         side = data.get('side')
-        roi = ((current_price - entry) / entry if side == 'BUY' else (entry - current_price) / entry) * 100.0 * float(self.lev)
+        if side not in ('BUY', 'SELL'):
+            return
+        leverage = float(data.get('leverage', self.lev) or self.lev)
+        roi = ((current_price - entry) / entry if side == 'BUY' else (entry - current_price) / entry) * 100.0 * leverage
         data['best_roi'] = roi if data.get('best_roi') is None else max(float(data.get('best_roi')), roi)
         data['worst_roi'] = roi if data.get('worst_roi') is None else min(float(data.get('worst_roi')), roi)
 
-        max_hold = float(_STRATEGY_CONFIG.get('max_hold_seconds', 0.0) or 0.0)
+        prefix = 'long' if side == 'BUY' else 'short'
+        tp = float(_STRATEGY_CONFIG.get(f'{prefix}_tp_roi_pct', 0) or 0)
+        sl = float(_STRATEGY_CONFIG.get(f'{prefix}_sl_roi_pct', 0) or 0)
+        emergency = float(_STRATEGY_CONFIG.get(f'{prefix}_emergency_stop_roi_pct', 0) or 0)
+        max_hold = float(_STRATEGY_CONFIG.get(f'{prefix}_max_hold_seconds', 0) or 0)
+
         if max_hold > 0 and float(data.get('opened_time', 0) or 0) > 0 and time.time() - float(data['opened_time']) >= max_hold:
-            self._close_symbol_position(symbol, reason=f"MAX_HOLD {max_hold:.0f}s")
+            self._close_symbol_position(symbol, reason=f"MAX_HOLD_{side} {max_hold:.0f}s")
             return
-
-        emergency = float(_STRATEGY_CONFIG.get('emergency_stop_roi', 0.0) or 0.0)
         if emergency > 0 and roi <= -abs(emergency):
-            self._close_symbol_position(symbol, reason=f"EMERGENCY_SL {emergency:.2f}%")
+            self._close_symbol_position(symbol, reason=f"EMERGENCY_SL_{side} {emergency:.2f}%")
             return
-
-        if side == 'BUY':
-            directional_tp = float(_STRATEGY_CONFIG.get('long_tp_roi_pct', 0.0) or 0.0)
-            directional_sl = float(_STRATEGY_CONFIG.get('long_sl_roi_pct', 0.0) or 0.0)
-        else:
-            directional_tp = float(_STRATEGY_CONFIG.get('short_tp_roi_pct', 0.0) or 0.0)
-            directional_sl = float(_STRATEGY_CONFIG.get('short_sl_roi_pct', 0.0) or 0.0)
-        generic_tp = float(_STRATEGY_CONFIG.get('strategy_tp_roi', 0.0) or 0.0)
-        generic_sl = float(_STRATEGY_CONFIG.get('strategy_sl_roi', 0.0) or 0.0)
-        effective_tp = directional_tp if directional_tp > 0 else generic_tp if generic_tp > 0 else float(self.tp or 0)
-        effective_sl = directional_sl if directional_sl > 0 else generic_sl if generic_sl > 0 else float(self.sl or 0)
 
         _, pnl_now = self._calc_roi_pnl_for_symbol(symbol, price=current_price)
         pnl_txt = f" | PnL≈{pnl_now:.4f}" if pnl_now is not None else ''
-        if effective_tp > 0 and roi >= effective_tp:
-            self.log(f"🎯 {symbol} đạt TP {effective_tp:.2f}% | ROI {roi:.2f}%{pnl_txt}")
-            self._close_symbol_position(symbol, reason=f"TP {effective_tp:.2f}%")
+        if tp > 0 and roi >= tp:
+            self.log(f"🎯 {symbol} {side} đạt TP {tp:.2f}% | ROI {roi:.2f}%{pnl_txt}")
+            self._close_symbol_position(symbol, reason=f"TP_{side} {tp:.2f}%")
             return
-        if effective_sl > 0 and roi <= -abs(effective_sl):
-            self.log(f"🛡️ {symbol} đạt SL {effective_sl:.2f}% | ROI {roi:.2f}%{pnl_txt}")
-            self._close_symbol_position(symbol, reason=f"SL {effective_sl:.2f}%")
+        if sl > 0 and roi <= -abs(sl):
+            self.log(f"🛡️ {symbol} {side} đạt SL {sl:.2f}% | ROI {roi:.2f}%{pnl_txt}")
+            self._close_symbol_position(symbol, reason=f"SL_{side} {sl:.2f}%")
             return
 
-        if float(_STRATEGY_CONFIG.get('profit_protect_enabled', 1.0) or 0.0) >= 0.5:
-            start = float(_STRATEGY_CONFIG.get('profit_protect_start_roi', 50.0) or 0.0)
-            pullback = float(_STRATEGY_CONFIG.get('profit_protect_pullback_roi', 30.0) or 0.0)
+        protect_enabled = float(_STRATEGY_CONFIG.get(f'enable_profit_protect_{prefix}', 1) or 0) >= 0.5
+        if protect_enabled:
+            start_roi = float(_STRATEGY_CONFIG.get(f'{prefix}_protect_start_roi_pct', 50) or 0)
+            pullback = float(_STRATEGY_CONFIG.get(f'{prefix}_protect_pullback_roi_pct', 30) or 0)
             best = float(data.get('best_roi', roi) or roi)
-            if best >= start and best - roi >= pullback:
-                self.log(f"🔒 {symbol} bảo vệ lợi nhuận: đỉnh {best:.2f}% -> {roi:.2f}%")
-                self._close_symbol_position(symbol, reason=f"TRAILING_PROFIT peak={best:.2f}%")
+            if start_roi > 0 and pullback > 0 and best >= start_roi and best - roi >= pullback:
+                self.log(f"🔒 {symbol} {side} bảo vệ lời: đỉnh {best:.2f}% -> {roi:.2f}%")
+                self._close_symbol_position(symbol, reason=f"TRAILING_PROFIT_{side} peak={best:.2f}%")
                 return
 
-        if float(_STRATEGY_CONFIG.get('enable_exit_on_opposite_signal', 0.0) or 0.0) >= 0.5:
+        exit_enabled = float(_STRATEGY_CONFIG.get(f'{prefix}_enable_exit_on_opposite_signal', 0) or 0) >= 0.5
+        if exit_enabled:
             now = time.time()
             if now - float(data.get('last_opposite_check', 0) or 0) >= 5:
                 data['last_opposite_check'] = now
                 details = self._get_fresh_realtime_signal(symbol, mode='entry', return_details=True)
                 opposite = 'SELL' if side == 'BUY' else 'BUY'
-                opposite_score = float(details.get('buy_score' if opposite == 'BUY' else 'sell_score', 0.0) or 0.0)
-                own_score = float(details.get('buy_score' if side == 'BUY' else 'sell_score', 0.0) or 0.0)
-                min_score = float(_STRATEGY_CONFIG.get('opposite_exit_min_score', 7.0) or 0.0)
+                opposite_score = float(details.get('buy_score' if opposite == 'BUY' else 'sell_score', 0) or 0)
+                own_score = float(details.get('buy_score' if side == 'BUY' else 'sell_score', 0) or 0)
+                min_score = float(_STRATEGY_CONFIG.get(f'{prefix}_opposite_exit_min_score', 7) or 0)
                 if opposite_score >= min_score and opposite_score > own_score:
-                    self._close_symbol_position(symbol, reason=f"OPPOSITE_SIGNAL {opposite} score={opposite_score:.2f}")
+                    self._close_symbol_position(symbol, reason=f"OPPOSITE_SIGNAL_{side} {opposite} score={opposite_score:.2f}")
                     return
 
-        if self._should_dca(symbol, roi):
-            self._add_dca(symbol, roi)
+        if self._should_dca(symbol, current_price):
+            self._add_dca(symbol, current_price, roi=roi)
 
     def _close_symbol_position(self, symbol, reason="", reverse_side=None):
         with self.symbol_locks[symbol], _ACCOUNT_RISK_LOCK:
@@ -2862,12 +3675,14 @@ class BaseBot:
                     self.log(f"⚠️ {symbol} không xác minh được vị thế thật; không gửi lệnh đóng mù")
                     return False
                 if not real_pos:
+                    _LIVE_DB.mark_position_closed(symbol, raw={'reason': 'BINANCE_ALREADY_ZERO', 'close_reason': reason})
                     self._reset_symbol_position(symbol)
                     return True
 
                 amt = float(real_pos.get('positionAmt', 0) or 0)
                 qty = abs(amt)
                 if qty <= 0:
+                    _LIVE_DB.mark_position_closed(symbol, raw={'reason': 'BINANCE_QTY_ZERO', 'close_reason': reason})
                     self._reset_symbol_position(symbol)
                     return True
                 old_side = 'BUY' if amt > 0 else 'SELL'
@@ -2887,6 +3702,11 @@ class BaseBot:
                     self.log(f"❌ {symbol} qty đóng không hợp lệ")
                     return False
 
+                _LIVE_DB.add_event(
+                    'CLOSE_REQUESTED', symbol, bot_id=self.bot_id, side=old_side,
+                    quantity=qty, price=self._get_fresh_price(symbol), margin=prev_margin,
+                    roi_pct=close_roi, pnl=close_pnl, reason=reason, raw={'position': real_pos},
+                )
                 cancel_all_orders(symbol, self.api_key, self.api_secret)
                 result = place_order(
                     symbol, close_side, qty, self.api_key, self.api_secret,
@@ -2894,6 +3714,9 @@ class BaseBot:
                 )
                 invalidate_position_cache(symbol, self.api_key)
                 if not (result and 'orderId' in result):
+                    _LIVE_DB.add_event('CLOSE_FAILED', symbol, bot_id=self.bot_id, side=old_side,
+                                       quantity=qty, margin=prev_margin, roi_pct=close_roi, pnl=close_pnl,
+                                       reason=reason, raw=result)
                     if not self._sync_symbol_position(symbol, force=True):
                         return True
                     self.log(f"❌ Đóng {symbol} thất bại | {result}")
@@ -2911,13 +3734,19 @@ class BaseBot:
                 pnl_txt = f" | PnL≈{close_pnl:.4f}" if close_pnl is not None else ''
                 self.log(f"🔴 Đã đóng {symbol} | {reason}{roi_txt}{pnl_txt}")
                 self._record_closed_trade_stats(symbol, close_roi, close_pnl)
+                _LIVE_DB.add_event('CLOSE_CONFIRMED', symbol, bot_id=self.bot_id, side=old_side,
+                                   quantity=qty, price=self._get_fresh_price(symbol), margin=prev_margin,
+                                   roi_pct=close_roi, pnl=close_pnl, reason=reason,
+                                   order_id=str(result.get('orderId')), raw=result)
+                _LIVE_DB.mark_position_closed(symbol, raw={'reason': reason, 'order': result, 'roi': close_roi, 'pnl': close_pnl})
 
                 if reverse_side is None:
                     reverse_side = self._reverse_side_after_close(symbol, old_side, reason)
                 self._reset_symbol_position(symbol)
 
                 if reverse_side:
-                    max_rev = int(_STRATEGY_CONFIG.get('max_reverse_count', 1) or 0)
+                    max_rev_key = 'long_max_reverse_count' if old_side == 'BUY' else 'short_max_reverse_count'
+                    max_rev = int(_STRATEGY_CONFIG.get(max_rev_key, 1) or 0)
                     if max_rev > 0 and prev_reverse_count >= max_rev:
                         self.log(f"⛔ {symbol} đã đạt max_reverse_count={max_rev}")
                         self._blacklist_and_stop_symbol(symbol, reason='MAX_REVERSE')
@@ -2958,6 +3787,9 @@ class BaseBot:
                 if float(_STRATEGY_CONFIG.get('trading_enabled', 1.0) or 0.0) < 0.5:
                     self.log("⏸️ TRADING_ENABLED đang tắt")
                     return False
+                if not _LIVE_DB.ready_for_new_orders():
+                    self.log(f"⛔ OPEN {symbol} bị chặn do PostgreSQL/instance lock: {_LIVE_DB.last_error}")
+                    return False
                 if self.symbol_data.get(symbol, {}).get('position_open'):
                     return False
 
@@ -2990,7 +3822,8 @@ class BaseBot:
                     self.log(f"❌ {symbol} không lấy được số dư")
                     return False
                 required_usd = float(margin_override) if margin_override is not None else margin_balance * (self.percent / 100.0)
-                per_symbol_cap = margin_balance * float(_STRATEGY_CONFIG.get('max_total_margin_per_symbol_pct', 4.0) or 0.0) / 100.0
+                cap_key = 'long_max_total_margin_per_symbol_pct' if side == 'BUY' else 'short_max_total_margin_per_symbol_pct'
+                per_symbol_cap = margin_balance * float(_STRATEGY_CONFIG.get(cap_key, 4.0) or 0.0) / 100.0
                 if per_symbol_cap > 0:
                     required_usd = min(required_usd, per_symbol_cap)
                 if required_usd <= 0 or required_usd > available_balance:
@@ -3012,9 +3845,20 @@ class BaseBot:
                     self.log(f"❌ {symbol} qty/notional dưới mức Binance")
                     return False
 
-                risk_ok, risk_reason = self._account_risk_check(symbol, required_usd, proposed_notional, margin_balance, available_balance)
+                risk_ok, risk_reason = self._account_risk_check(symbol, side, required_usd, proposed_notional, margin_balance, available_balance)
                 if not risk_ok:
                     self.log(f"🛑 Chặn OPEN {symbol}: {risk_reason}")
+                    return False
+
+                requested_ok = _LIVE_DB.add_event(
+                    'REVERSE_REQUESTED' if is_reverse else 'OPEN_REQUESTED',
+                    symbol, bot_id=self.bot_id, side=side, quantity=qty,
+                    price=current_price, margin=required_usd, notional=proposed_notional,
+                    reason=details.get('reason'), raw={'signal': details, 'reverse_count': reverse_count},
+                    required=_LIVE_DB.required_for_new_orders,
+                )
+                if _LIVE_DB.required_for_new_orders and not requested_ok:
+                    self.log(f"⛔ OPEN {symbol} không ghi được event vào PostgreSQL")
                     return False
 
                 result = place_order(
@@ -3024,6 +3868,11 @@ class BaseBot:
                 )
                 invalidate_position_cache(symbol, self.api_key)
                 if not (result and 'orderId' in result):
+                    _LIVE_DB.add_event(
+                        'REVERSE_FAILED' if is_reverse else 'OPEN_FAILED', symbol,
+                        bot_id=self.bot_id, side=side, quantity=qty, price=current_price,
+                        margin=required_usd, reason='BINANCE_ORDER_FAILED', raw=result,
+                    )
                     self.log(f"❌ {symbol} lỗi mở lệnh: {result}")
                     return False
 
@@ -3044,7 +3893,9 @@ class BaseBot:
                     'side': side, 'position_open': True, 'status': 'open',
                     'last_trade_time': time.time(), 'margin_used': required_usd,
                     'initial_margin': required_usd, 'current_margin': required_usd,
-                    'dca_count': 0, 'last_dca_time': 0.0,
+                    'last_order_margin': required_usd,
+                    'initial_entry_price': avg_price, 'last_dca_price': avg_price,
+                    'dca_count': 0, 'last_dca_time': 0.0, 'leverage': int(self.lev),
                     'reverse_count': int(reverse_count) if is_reverse else 0,
                     'best_roi': 0.0, 'worst_roi': 0.0,
                     'opened_time': time.time(), 'entry_candle_time': candle_time,
@@ -3055,6 +3906,13 @@ class BaseBot:
                     _LAST_ENTRY_CANDLE[symbol] = candle_time
                 self.bot_coordinator.bot_has_coin(self.bot_id)
                 self.consecutive_failures = 0
+                _LIVE_DB.save_position(self.bot_id, symbol, self.symbol_data[symbol], raw={'order': result})
+                _LIVE_DB.add_event(
+                    'REVERSE_CONFIRMED' if is_reverse else 'OPEN_CONFIRMED', symbol,
+                    bot_id=self.bot_id, side=side, quantity=executed_qty, price=avg_price,
+                    margin=required_usd, notional=executed_qty * avg_price,
+                    order_id=str(result.get('orderId')), reason=details.get('reason'), raw=result,
+                )
                 self.log(
                     f"✅ OPEN LIVE {symbol} {side} | entry={avg_price:.8g} | qty={executed_qty:.8g} "
                     f"| margin={required_usd:.4f} | lev={self.lev}x | score={float(details.get('selected_score',0)):.2f}"
@@ -3068,7 +3926,10 @@ class BaseBot:
         ok, positions = get_positions_strict_all(self.api_key, self.api_secret)
         if not ok:
             return None
-        result = {'long_notional': 0.0, 'short_notional': 0.0, 'total_notional': 0.0, 'count': 0, 'symbols': set()}
+        result = {
+            'long_notional': 0.0, 'short_notional': 0.0, 'total_notional': 0.0,
+            'count': 0, 'long_count': 0, 'short_count': 0, 'symbols': set(),
+        }
         for pos in positions:
             amt = float(pos.get('positionAmt', 0) or 0)
             if abs(amt) <= 0:
@@ -3079,51 +3940,56 @@ class BaseBot:
             result['symbols'].add(str(pos.get('symbol', '')).upper())
             if amt > 0:
                 result['long_notional'] += notional
+                result['long_count'] += 1
             else:
                 result['short_notional'] += notional
+                result['short_count'] += 1
         result['total_notional'] = result['long_notional'] + result['short_notional']
         return result
 
     def _apply_side_balance(self, details):
         details = dict(details or {})
-        if float(_STRATEGY_CONFIG.get('enable_side_balance', 1.0) or 0.0) < 0.5:
-            return details
         exposure = self._account_exposure()
         if exposure is None:
             details['signal'] = None
             details['reason'] = 'Không lấy được exposure tài khoản; chặn tín hiệu'
             return details
-        long_n = float(exposure['long_notional']); short_n = float(exposure['short_notional'])
-        threshold = max(1.0, float(_STRATEGY_CONFIG.get('side_balance_threshold', 1.25) or 1.25))
+        long_n = float(exposure['long_notional'])
+        short_n = float(exposure['short_notional'])
         preferred = None
-        if long_n > 0 and short_n <= 0:
+        if long_n > 0 and short_n <= 0 and float(_STRATEGY_CONFIG.get('enable_side_balance_sell', 1) or 0) >= 0.5:
             preferred = 'SELL'
-        elif short_n > 0 and long_n <= 0:
+        elif short_n > 0 and long_n <= 0 and float(_STRATEGY_CONFIG.get('enable_side_balance_buy', 1) or 0) >= 0.5:
             preferred = 'BUY'
         elif long_n > 0 and short_n > 0:
-            if long_n / short_n > threshold:
-                preferred = 'SELL'
-            elif short_n / long_n > threshold:
+            buy_threshold = max(1.0, float(_STRATEGY_CONFIG.get('buy_side_balance_threshold', 1.25) or 1.25))
+            sell_threshold = max(1.0, float(_STRATEGY_CONFIG.get('sell_side_balance_threshold', 1.25) or 1.25))
+            if short_n / long_n > buy_threshold and float(_STRATEGY_CONFIG.get('enable_side_balance_buy', 1) or 0) >= 0.5:
                 preferred = 'BUY'
+            elif long_n / short_n > sell_threshold and float(_STRATEGY_CONFIG.get('enable_side_balance_sell', 1) or 0) >= 0.5:
+                preferred = 'SELL'
         if not preferred:
             return details
+
         reason = f"Cân bằng LIVE LONG={long_n:.2f}, SHORT={short_n:.2f}, ưu tiên {preferred}"
-        mode = str(_STRATEGY_CONFIG.get('side_balance_mode', 'override')).lower()
+        mode_key = 'buy_side_balance_mode' if preferred == 'BUY' else 'sell_side_balance_mode'
+        score_key = 'buy_balance_override_min_signal_score' if preferred == 'BUY' else 'sell_balance_override_min_signal_score'
+        mode = str(_STRATEGY_CONFIG.get(mode_key, 'filter')).lower()
         current = details.get('signal')
-        preferred_score = float(details.get('buy_score' if preferred == 'BUY' else 'sell_score', 0.0) or 0.0)
+        preferred_score = float(details.get('buy_score' if preferred == 'BUY' else 'sell_score', 0) or 0)
         if mode == 'filter':
             if current != preferred:
                 details['signal'] = None
                 details['selected_score'] = preferred_score
                 details['reason'] = reason + '; tín hiệu hiện tại bị lọc'
         else:
-            min_score = float(_STRATEGY_CONFIG.get('balance_override_min_signal_score', 3.0) or 0.0)
+            min_score = float(_STRATEGY_CONFIG.get(score_key, 7 if preferred == 'BUY' else 5) or 0)
             if preferred_score >= min_score:
                 details['signal'] = preferred
                 details['side'] = preferred
                 details['selected_score'] = preferred_score
                 details['score'] = preferred_score
-                details['reason'] = reason + f"; override score={preferred_score:.2f}"
+                details['reason'] = reason + f'; override score={preferred_score:.2f}'
             elif current != preferred:
                 details['signal'] = None
                 details['selected_score'] = preferred_score
@@ -3131,7 +3997,7 @@ class BaseBot:
         details['balance_reason'] = reason
         return details
 
-    def _account_risk_check(self, symbol, requested_margin, proposed_notional, margin_balance, available_balance):
+    def _account_risk_check(self, symbol, side, requested_margin, proposed_notional, margin_balance, available_balance):
         exposure = self._account_exposure()
         if exposure is None:
             return False, 'API positionRisk lỗi'
@@ -3139,39 +4005,71 @@ class BaseBot:
             return False, 'Tài khoản đã có vị thế symbol này'
         max_positions = int(_STRATEGY_CONFIG.get('max_positions', 3) or 0)
         if max_positions > 0 and exposure['count'] >= max_positions:
-            return False, f"Đã đạt max_positions={max_positions}"
-        max_total_pct = float(_STRATEGY_CONFIG.get('max_total_notional_pct', 150.0) or 0.0)
-        max_total = margin_balance * max_total_pct / 100.0 if max_total_pct > 0 else 0.0
+            return False, f'Đã đạt max_positions={max_positions}'
+        if side == 'BUY':
+            max_side_positions = int(_STRATEGY_CONFIG.get('max_long_positions', 3) or 0)
+            side_count = int(exposure.get('long_count', 0))
+            side_notional = float(exposure['long_notional'])
+            side_notional_pct = float(_STRATEGY_CONFIG.get('max_long_notional_pct', 100) or 0)
+            cap_pct = float(_STRATEGY_CONFIG.get('long_max_total_margin_per_symbol_pct', 4) or 0)
+        else:
+            max_side_positions = int(_STRATEGY_CONFIG.get('max_short_positions', 3) or 0)
+            side_count = int(exposure.get('short_count', 0))
+            side_notional = float(exposure['short_notional'])
+            side_notional_pct = float(_STRATEGY_CONFIG.get('max_short_notional_pct', 100) or 0)
+            cap_pct = float(_STRATEGY_CONFIG.get('short_max_total_margin_per_symbol_pct', 4) or 0)
+        if max_side_positions > 0 and side_count >= max_side_positions:
+            return False, f'Đã đạt max_{side.lower()}_positions={max_side_positions}'
+        max_total_pct = float(_STRATEGY_CONFIG.get('max_total_notional_pct', 150) or 0)
+        max_total = margin_balance * max_total_pct / 100.0 if max_total_pct > 0 else 0
         if max_total > 0 and exposure['total_notional'] + proposed_notional > max_total:
-            return False, f"Vượt max total notional {max_total:.2f}"
-        cap_pct = float(_STRATEGY_CONFIG.get('max_total_margin_per_symbol_pct', 4.0) or 0.0)
+            return False, f'Vượt max total notional {max_total:.2f}'
+        max_side_notional = margin_balance * side_notional_pct / 100.0 if side_notional_pct > 0 else 0
+        if max_side_notional > 0 and side_notional + proposed_notional > max_side_notional:
+            return False, f'Vượt max notional riêng {side} {max_side_notional:.2f}'
         if cap_pct > 0 and requested_margin > margin_balance * cap_pct / 100.0 + 1e-9:
-            return False, 'Vượt margin tối đa mỗi symbol'
+            return False, f'Vượt margin tối đa mỗi symbol {side}'
         if requested_margin > available_balance:
             return False, 'Không đủ available balance'
         return True, 'OK'
 
-    def _should_dca(self, symbol, roi):
+    def _should_dca(self, symbol, current_price):
         data = self.symbol_data.get(symbol, {})
         side = data.get('side')
-        if side == 'BUY' and float(_STRATEGY_CONFIG.get('enable_dca_long', 1.0) or 0.0) < 0.5:
+        if side not in ('BUY', 'SELL') or current_price <= 0:
             return False
-        if side == 'SELL' and float(_STRATEGY_CONFIG.get('enable_dca_short', 1.0) or 0.0) < 0.5:
+        if side == 'BUY':
+            enabled = float(_STRATEGY_CONFIG.get('enable_dca_long', 1) or 0) >= 0.5
+            max_steps = int(_STRATEGY_CONFIG.get('long_max_dca_steps', 3) or 0)
+            min_gap = float(_STRATEGY_CONFIG.get('long_dca_min_seconds_between_adds', 20) or 0)
+            trigger_pct = float(_STRATEGY_CONFIG.get('long_dca_trigger_price_pct', 1) or 0)
+        else:
+            enabled = float(_STRATEGY_CONFIG.get('enable_dca_short', 1) or 0) >= 0.5
+            max_steps = int(_STRATEGY_CONFIG.get('short_max_dca_steps', 3) or 0)
+            min_gap = float(_STRATEGY_CONFIG.get('short_dca_min_seconds_between_adds', 20) or 0)
+            trigger_pct = float(_STRATEGY_CONFIG.get('short_dca_trigger_price_pct', 1) or 0)
+        if not enabled or trigger_pct <= 0:
             return False
         count = int(data.get('dca_count', 0) or 0)
-        if count >= int(_STRATEGY_CONFIG.get('max_dca_steps', 3) or 0):
+        if count >= max_steps:
             return False
-        min_gap = float(_STRATEGY_CONFIG.get('dca_min_seconds_between_adds', 20) or 0)
         if time.time() - float(data.get('last_dca_time', 0) or 0) < min_gap:
             return False
-        level = float(_STRATEGY_CONFIG.get('dca_trigger_roi_pct', 25.0) or 0.0) * (count + 1)
-        mode = str(_STRATEGY_CONFIG.get('dca_mode', 'loss')).lower()
-        return roi <= -level if mode == 'loss' else roi >= level
+        reference_price = float(data.get('last_dca_price') or data.get('initial_entry_price') or data.get('entry') or 0)
+        if reference_price <= 0:
+            return False
+        adverse_pct = ((reference_price - current_price) / reference_price * 100.0
+                       if side == 'BUY' else (current_price - reference_price) / reference_price * 100.0)
+        data['last_dca_adverse_pct'] = adverse_pct
+        return adverse_pct >= trigger_pct
 
-    def _add_dca(self, symbol, roi):
+    def _add_dca(self, symbol, current_price, roi=None):
         with self.symbol_locks[symbol], _ACCOUNT_RISK_LOCK:
             data = self.symbol_data.get(symbol, {})
-            if not data.get('position_open') or not self._should_dca(symbol, roi):
+            if not data.get('position_open') or not self._should_dca(symbol, current_price):
+                return False
+            if not _LIVE_DB.ready_for_new_orders():
+                self.log(f'⛔ DCA {symbol} bị chặn do PostgreSQL/instance lock: {_LIVE_DB.last_error}')
                 return False
             ok, pos = get_position_strict(symbol, self.api_key, self.api_secret)
             if not ok or not pos:
@@ -3180,48 +4078,103 @@ class BaseBot:
             if abs(amt) <= 0:
                 return False
             side = 'BUY' if amt > 0 else 'SELL'
+            old_qty_abs = abs(amt)
+            old_average_entry = float(pos.get('entryPrice', 0) or data.get('entry', current_price) or current_price)
             count = int(data.get('dca_count', 0) or 0)
             step_num = count + 1
-            initial_margin = float(data.get('initial_margin') or data.get('margin_used') or 0.0)
-            add_margin = initial_margin * (float(_STRATEGY_CONFIG.get('dca_multiplier', 1.10) or 1.0) ** step_num)
-            total_balance, available = get_total_and_available_balance(self.api_key, self.api_secret)
+            initial_margin = float(data.get('initial_margin') or data.get('margin_used') or 0)
+            if initial_margin <= 0:
+                initial_margin = old_qty_abs * old_average_entry / max(float(self.lev), 1.0)
+                data['initial_margin'] = initial_margin
+
+            if side == 'BUY':
+                order_multiplier = float(_STRATEGY_CONFIG.get('long_dca_order_multiplier', 1) or 0)
+                max_steps = int(_STRATEGY_CONFIG.get('long_max_dca_steps', 3) or 0)
+                cap_pct = float(_STRATEGY_CONFIG.get('long_max_total_margin_per_symbol_pct', 4) or 0)
+                side_notional_cap_pct = float(_STRATEGY_CONFIG.get('max_long_notional_pct', 100) or 0)
+            else:
+                order_multiplier = float(_STRATEGY_CONFIG.get('short_dca_order_multiplier', 1) or 0)
+                max_steps = int(_STRATEGY_CONFIG.get('short_max_dca_steps', 3) or 0)
+                cap_pct = float(_STRATEGY_CONFIG.get('short_max_total_margin_per_symbol_pct', 4) or 0)
+                side_notional_cap_pct = float(_STRATEGY_CONFIG.get('max_short_notional_pct', 100) or 0)
+            if count >= max_steps or order_multiplier <= 0:
+                return False
+            last_order_margin = float(data.get('last_order_margin') or initial_margin or 0)
+            if last_order_margin <= 0:
+                return False
+            # Yêu cầu: vốn DCA mới = vốn của LẦN VÀO GẦN NHẤT × hệ số.
+            add_margin = last_order_margin * order_multiplier
+            _, available = get_total_and_available_balance(self.api_key, self.api_secret)
             margin_balance = get_margin_balance(self.api_key, self.api_secret)
             if margin_balance is None or available is None or add_margin <= 0:
                 return False
             current_margin = float(data.get('current_margin') or data.get('margin_used') or initial_margin)
-            cap = margin_balance * float(_STRATEGY_CONFIG.get('max_total_margin_per_symbol_pct', 4.0) or 0.0) / 100.0
-            if cap > 0 and current_margin + add_margin > cap:
-                self.log(f"⛔ DCA {symbol} bước {step_num} vượt cap margin symbol")
+            cap = margin_balance * cap_pct / 100.0 if cap_pct > 0 else 0
+            if cap > 0 and current_margin + add_margin > cap + 1e-9:
+                self.log(f'⛔ DCA {symbol} {side} bước {step_num} vượt cap margin {cap:.4f}')
                 return False
-            price = self._get_fresh_price(symbol)
+            price = float(current_price or self._get_fresh_price(symbol))
             if price <= 0 or add_margin > available:
                 return False
+            leverage = float(pos.get('leverage', self.lev) or self.lev)
             step_size = get_step_size(symbol)
-            add_qty = add_margin * float(self.lev) / price
+            add_qty = add_margin * leverage / price
             if step_size > 0:
                 add_qty = math.floor(add_qty / step_size) * step_size
                 add_qty = round(add_qty, 8)
             if add_qty < get_min_qty_from_cache(symbol) or add_qty * price < get_min_notional_from_cache(symbol):
+                self.log(f'⛔ DCA {symbol}: quantity/notional thấp hơn Binance filter')
                 return False
+
             exposure = self._account_exposure()
-            max_pct = float(_STRATEGY_CONFIG.get('max_total_notional_pct', 150.0) or 0.0)
-            max_total = margin_balance * max_pct / 100.0 if max_pct > 0 else 0.0
-            if exposure is None or (max_total > 0 and exposure['total_notional'] + add_qty * price > max_total):
-                self.log(f"⛔ DCA {symbol} bị chặn bởi tổng notional")
+            if exposure is None:
+                return False
+            add_notional = add_qty * price
+            max_total_pct = float(_STRATEGY_CONFIG.get('max_total_notional_pct', 150) or 0)
+            max_total = margin_balance * max_total_pct / 100.0 if max_total_pct > 0 else 0
+            if max_total > 0 and exposure['total_notional'] + add_notional > max_total:
+                self.log(f'⛔ DCA {symbol} bị chặn bởi tổng notional')
+                return False
+            current_side_notional = exposure['long_notional'] if side == 'BUY' else exposure['short_notional']
+            side_cap = margin_balance * side_notional_cap_pct / 100.0 if side_notional_cap_pct > 0 else 0
+            if side_cap > 0 and current_side_notional + add_notional > side_cap:
+                self.log(f'⛔ DCA {symbol} bị chặn bởi notional riêng {side}')
+                return False
+
+            reference_price = float(data.get('last_dca_price') or data.get('initial_entry_price') or data.get('entry') or price)
+            adverse_pct = ((reference_price - price) / reference_price * 100.0
+                           if side == 'BUY' else (price - reference_price) / reference_price * 100.0)
+            event_ok = _LIVE_DB.add_event(
+                'DCA_REQUESTED', symbol, bot_id=self.bot_id, side=side, quantity=add_qty,
+                price=price, margin=add_margin, roi_pct=roi, dca_step=step_num,
+                reason=f'adverse_price={adverse_pct:.6f}% ref={reference_price:.12g}',
+                raw={'position': pos}, required=_LIVE_DB.required_for_new_orders,
+            )
+            if _LIVE_DB.required_for_new_orders and not event_ok:
                 return False
             result = place_order(
                 symbol, side, add_qty, self.api_key, self.api_secret,
-                reduce_only=False, client_order_id=f"dca{step_num}_{int(time.time())}_{random.randint(1000,9999)}"
+                reduce_only=False, client_order_id=f'dca{step_num}_{int(time.time())}_{random.randint(1000,9999)}'
             )
             invalidate_position_cache(symbol, self.api_key)
             if not (result and 'orderId' in result):
-                self.log(f"❌ DCA {symbol} thất bại: {result}")
+                _LIVE_DB.add_event('DCA_FAILED', symbol, bot_id=self.bot_id, side=side,
+                                   quantity=add_qty, price=price, margin=add_margin,
+                                   roi_pct=roi, dca_step=step_num, reason='BINANCE_ORDER_FAILED', raw=result)
                 return False
+
+            fill_price = float(result.get('avgPrice', 0) or price)
             time.sleep(0.5)
             ok, new_pos = get_position_strict(symbol, self.api_key, self.api_secret)
             if ok and new_pos and abs(float(new_pos.get('positionAmt', 0) or 0)) > 0:
                 new_amt = float(new_pos.get('positionAmt', 0) or 0)
+                new_qty_abs = abs(new_amt)
                 new_entry = float(new_pos.get('entryPrice', 0) or data.get('entry', price))
+                actually_added = max(0.0, new_qty_abs - old_qty_abs)
+                if actually_added > 1e-12 and new_entry > 0 and old_average_entry > 0:
+                    derived = (new_entry * new_qty_abs - old_average_entry * old_qty_abs) / actually_added
+                    if derived > 0:
+                        fill_price = derived
                 data['qty'] = new_amt
                 data['entry'] = new_entry
                 data['entry_base'] = new_entry
@@ -3229,17 +4182,26 @@ class BaseBot:
                 old_qty = abs(float(data.get('qty', 0) or 0))
                 new_qty = old_qty + add_qty
                 old_entry = float(data.get('entry', price) or price)
-                data['entry'] = (old_entry * old_qty + price * add_qty) / max(new_qty, 1e-12)
+                data['entry'] = (old_entry * old_qty + fill_price * add_qty) / max(new_qty, 1e-12)
                 data['entry_base'] = data['entry']
                 data['qty'] = new_qty if side == 'BUY' else -new_qty
+            data['initial_entry_price'] = float(data.get('initial_entry_price') or reference_price)
+            data['last_dca_price'] = fill_price
             data['current_margin'] = current_margin + add_margin
             data['margin_used'] = data['current_margin']
+            data['last_order_margin'] = add_margin
             data['dca_count'] = step_num
             data['last_dca_time'] = time.time()
-            self.log(
-                f"➕ DCA LIVE {symbol} {side} bước {step_num}/{int(_STRATEGY_CONFIG.get('max_dca_steps',3))} "
-                f"| add_margin={add_margin:.4f} | avg_entry={float(data.get('entry',0)):.8g}"
-            )
+            data['leverage'] = int(leverage)
+            saved = _LIVE_DB.save_position(self.bot_id, symbol, data, raw={'order': result, 'position': new_pos if ok else None})
+            _LIVE_DB.add_event('DCA_CONFIRMED', symbol, bot_id=self.bot_id, side=side,
+                               quantity=add_qty, price=fill_price, margin=add_margin,
+                               roi_pct=roi, dca_step=step_num,
+                               reason=f'adverse_price={adverse_pct:.6f}% ref={reference_price:.12g}',
+                               order_id=str(result.get('orderId')), raw={'order': result, 'position': new_pos if ok else None})
+            if not saved:
+                self.log(f'⚠️ DCA đã khớp nhưng chưa lưu được DB: {_LIVE_DB.last_error}')
+            self.log(f'➕ DCA LIVE {symbol} {side} bước {step_num}/{max_steps} | lệch={adverse_pct:.4f}% | ref={reference_price:.8g} fill={fill_price:.8g} | vốn gần nhất={last_order_margin:.4f} × {order_multiplier:.4f} = {add_margin:.4f}')
             return True
 
     @staticmethod
@@ -3260,16 +4222,17 @@ class BaseBot:
     def _reverse_side_after_close(self, symbol, old_side, reason):
         if self._close_reason_code(reason) not in {'SL', 'TRAILING_PROFIT', 'OPPOSITE_SIGNAL'}:
             return None
-        mode = str(_STRATEGY_CONFIG.get('reverse_mode', 'confirmed')).lower()
+        prefix = 'long' if old_side == 'BUY' else 'short'
+        mode = str(_STRATEGY_CONFIG.get(f'{prefix}_reverse_mode', 'confirmed')).lower()
         if mode == 'none':
             return None
         opposite = 'SELL' if old_side == 'BUY' else 'BUY'
         if mode == 'immediate':
             return opposite
         details = self._get_fresh_realtime_signal(symbol, mode='entry', return_details=True)
-        opposite_score = float(details.get('buy_score' if opposite == 'BUY' else 'sell_score', 0.0) or 0.0)
-        old_score = float(details.get('buy_score' if old_side == 'BUY' else 'sell_score', 0.0) or 0.0)
-        min_score = float(_STRATEGY_CONFIG.get('reverse_min_score', 7.0) or 0.0)
+        opposite_score = float(details.get('buy_score' if opposite == 'BUY' else 'sell_score', 0) or 0)
+        old_score = float(details.get('buy_score' if old_side == 'BUY' else 'sell_score', 0) or 0)
+        min_score = float(_STRATEGY_CONFIG.get(f'{prefix}_reverse_min_score', 7) or 0)
         if opposite_score >= min_score and opposite_score > old_score:
             return opposite
         return None
@@ -3339,6 +4302,7 @@ class BaseBot:
 
             if abs(amt) <= 0:
                 self.log(f"ℹ️ {symbol} - Binance xác nhận không còn vị thế, đồng bộ local về trạng thái chờ và tiếp tục theo dõi coin.")
+                _LIVE_DB.mark_position_closed(symbol, raw={'reason': 'BINANCE_POSITION_ZERO_ON_SYNC'})
                 self._reset_symbol_position(symbol)
                 return False
 
@@ -3356,6 +4320,20 @@ class BaseBot:
             if entry_price > 0:
                 data['entry'] = entry_price
                 data['entry_base'] = entry_price
+                if float(data.get('initial_entry_price', 0) or 0) <= 0:
+                    data['initial_entry_price'] = entry_price
+                if float(data.get('last_dca_price', 0) or 0) <= 0:
+                    data['last_dca_price'] = entry_price
+            lev = int(float((pos or {}).get('leverage', data.get('leverage', self.lev)) or self.lev))
+            data['leverage'] = lev
+            if float(data.get('current_margin', 0) or 0) <= 0 and entry_price > 0:
+                data['current_margin'] = abs(amt) * entry_price / max(float(lev), 1.0)
+                data['margin_used'] = data['current_margin']
+            if float(data.get('last_order_margin', 0) or 0) <= 0:
+                data['last_order_margin'] = float(data.get('initial_margin', 0) or data.get('current_margin', 0) or 0)
+            if now - float(data.get('last_db_position_sync', 0) or 0) >= 15:
+                data['last_db_position_sync'] = now
+                _LIVE_DB.save_position(self.bot_id, symbol, data, raw={'binance_position': pos})
             return True
         except Exception as e:
             logger.error(f"Lỗi sync vị thế {symbol}: {str(e)}")
@@ -3399,33 +4377,22 @@ class BaseBot:
             return {'_api_error': True}
 
     def _check_symbol_position(self, symbol):
-        """Kiểm tra vị thế thủ công/có cooldown. Không gọi lặp 2 lần để tránh spam API."""
+        """Đồng bộ an toàn: lỗi API không được hiểu là vị thế đã biến mất."""
         try:
             pos = get_position_cached(symbol, self.api_key, self.api_secret, ttl=15.0, force=False)
-            if pos and not pos.get('_api_error'):
-                amt = float(pos.get('positionAmt', 0))
-                if abs(amt) > 0:
-                    if not self.symbol_data[symbol]['position_open']:
-                        entry_price = float(pos.get('entryPrice', 0))
-                        if entry_price == 0:
-                            return
-                        self.symbol_data[symbol].update({
-                            'position_open': True,
-                            'entry': entry_price,
-                            'entry_base': entry_price,
-                            'qty': amt,
-                            'side': 'BUY' if amt > 0 else 'SELL',
-                            'status': 'open'
-                        })
-                        self.log(f"📌 Phát hiện vị thế {symbol} từ API")
+            if pos and pos.get('_api_error'):
+                return
+            amt = float((pos or {}).get('positionAmt', 0) or 0)
+            if abs(amt) > 0:
+                if not self.symbol_data[symbol].get('position_open'):
+                    self._restore_live_position_state(symbol)
                 else:
-                    if self.symbol_data[symbol]['position_open']:
-                        self._reset_symbol_position(symbol)
-            else:
-                if self.symbol_data[symbol]['position_open']:
-                    self._reset_symbol_position(symbol)
-        except Exception as e:
-            logger.error(f"Lỗi kiểm tra vị thế {symbol}: {str(e)}")
+                    self._sync_symbol_position(symbol, force=True)
+            elif self.symbol_data[symbol].get('position_open'):
+                _LIVE_DB.mark_position_closed(symbol, raw={'reason': 'BINANCE_POSITION_ZERO_CHECK'})
+                self._reset_symbol_position(symbol)
+        except Exception as exc:
+            logger.error(f'Lỗi kiểm tra vị thế {symbol}: {exc}')
 
     def _reset_symbol_position(self, symbol):
         if symbol in self.symbol_data:
@@ -3433,7 +4400,9 @@ class BaseBot:
                 'position_open': False, 'entry': 0.0, 'entry_base': 0.0,
                 'side': None, 'qty': 0.0, 'status': 'closed',
                 'margin_used': 0.0, 'initial_margin': 0.0, 'current_margin': 0.0,
-                'dca_count': 0, 'last_dca_time': 0.0,
+                'last_order_margin': 0.0,
+                'initial_entry_price': 0.0, 'last_dca_price': 0.0,
+                'dca_count': 0, 'last_dca_time': 0.0, 'reverse_count': 0,
                 'best_roi': None, 'worst_roi': None,
                 'opened_time': 0.0, 'entry_candle_time': 0,
                 'signal_score': 0.0, 'balance_reason': '',
@@ -3545,10 +4514,18 @@ class BotManager:
         self.coin_manager = CoinManager()
         self.symbol_locks = defaultdict(threading.RLock)
 
+        if _LIVE_DB.configured and not _LIVE_DB.available:
+            _LIVE_DB.connect_and_prepare()
+        if _LIVE_DB.configured and not _LIVE_DB.lock_acquired:
+            self.log(f"⚠️ PostgreSQL chưa có instance lock: {_LIVE_DB.last_error}")
+
         if api_key and api_secret:
-            self._verify_api_connection()
-            self.log("🟢 HỆ THỐNG BOT RELATIVE CANDLE - CLEAN")
+            if not self._verify_api_connection():
+                self.running = False
+                raise RuntimeError('Không xác minh được kết nối Binance LIVE/One-way mode')
+            self.log("🟢 HỆ THỐNG BOT LIVE EMA + VOLUME + POSTGRESQL")
             self._initialize_cache()
+            self._recover_live_positions()
             self._cache_thread = threading.Thread(target=self._cache_updater, daemon=True, name='cache_updater')
             self._cache_thread.start()
             self.telegram_thread = threading.Thread(target=self._telegram_listener, daemon=True, name='telegram')
@@ -3557,6 +4534,59 @@ class BotManager:
                 self.send_main_menu(self.telegram_chat_id)
         else:
             self.log("⚡ BotManager đã khởi động ở chế độ không cấu hình")
+
+    def _recover_live_positions(self):
+        """Khôi phục mọi vị thế Futures đang mở sau khi Railway restart.
+
+        Binance là nguồn sự thật về quantity/side/entry. PostgreSQL chỉ bổ sung
+        metadata như số lần DCA, giá lần nhồi gần nhất và margin ban đầu.
+        Bot khôi phục chỉ quản lý vị thế hiện có; sau khi đóng sẽ không tự mở lệnh mới.
+        """
+        try:
+            ok, positions = get_positions_strict_all(self.api_key, self.api_secret)
+            if not ok:
+                self.log('⚠️ Chưa thể đọc vị thế Binance để khôi phục; không tạo bot giám sát giả')
+                return 0
+            open_positions = [p for p in positions if abs(float(p.get('positionAmt', 0) or 0)) > 0]
+            if not open_positions:
+                return 0
+
+            total_wallet, _ = get_total_and_available_balance(self.api_key, self.api_secret)
+            total_wallet = float(total_wallet or 0.0)
+            recovered = 0
+            for pos in open_positions:
+                symbol = str(pos.get('symbol', '') or '').upper()
+                if not symbol or any(symbol in getattr(bot, 'active_symbols', []) for bot in self.bots.values()):
+                    continue
+                leverage = max(1, int(float(pos.get('leverage', 1) or 1)))
+                qty = abs(float(pos.get('positionAmt', 0) or 0))
+                entry = float(pos.get('entryPrice', 0) or 0)
+                current_margin = qty * entry / leverage if entry > 0 else 0.0
+                db_state = _LIVE_DB.load_position(symbol) if _LIVE_DB.configured else None
+                initial_margin = float((db_state or {}).get('initial_margin', 0) or current_margin)
+                percent = (initial_margin / total_wallet * 100.0) if total_wallet > 0 else 1.0
+                percent = max(0.01, min(100.0, percent))
+                bot_id = f"RECOVERED_{symbol}_{int(time.time())}_{recovered}"
+                bot = BaseBot(
+                    symbol, leverage, percent, None, None, self.ws_manager,
+                    self.api_key, self.api_secret, self.telegram_bot_token, self.telegram_chat_id,
+                    coin_manager=self.coin_manager, symbol_locks=self.symbol_locks,
+                    bot_coordinator=self.bot_coordinator, bot_id=bot_id, max_coins=1,
+                    strategy_name='RECOVERED_LIVE', kline_manager=self.kline_manager,
+                    auto_search_when_empty=False, monitor_existing_only=True,
+                )
+                bot._bot_manager = self
+                bot.coin_finder.set_bot_manager(self)
+                self.bots[bot_id] = bot
+                recovered += 1
+                side = 'BUY' if float(pos.get('positionAmt', 0) or 0) > 0 else 'SELL'
+                self.log(f'♻️ Khôi phục giám sát {symbol} {side} | leverage={leverage}x')
+            if recovered:
+                self.log(f'✅ Đã khôi phục {recovered} vị thế LIVE từ Binance + PostgreSQL')
+            return recovered
+        except Exception as exc:
+            self.log(f'⚠️ Lỗi khôi phục vị thế LIVE: {exc}')
+            return 0
 
     def _initialize_cache(self):
         logger.info("🔄 Hệ thống đang khởi tạo cache...")
@@ -3583,6 +4613,21 @@ class BotManager:
                 except Exception:
                     active = []
                 cleanup_runtime_caches(active, aggressive=True)
+                if _LIVE_DB.configured:
+                    _LIVE_DB.ping(force=True)
+                    try:
+                        total, available = get_total_and_available_balance(self.api_key, self.api_secret)
+                        margin = get_margin_balance(self.api_key, self.api_secret)
+                        positions = get_positions(api_key=self.api_key, api_secret=self.api_secret)
+                        unrealized = sum(float(p.get('unRealizedProfit', 0) or 0) for p in positions)
+                        exposure = None
+                        for bot in self.bots.values():
+                            exposure = bot._account_exposure()
+                            if exposure is not None:
+                                break
+                        _LIVE_DB.save_equity_snapshot(total, available, margin, unrealized, exposure or {})
+                    except Exception as snapshot_error:
+                        logger.error(f'Lỗi lưu equity snapshot: {snapshot_error}')
             except Exception as e:
                 logger.error(f"❌ Lỗi làm mới cache tự động: {str(e)}")
 
@@ -3691,10 +4736,11 @@ class BotManager:
                 summary += "📋 **CHI TIẾT BOT**:\n"
                 for bot in bot_details:
                     status_emoji = "🟢" if bot['is_trading'] else "🟡" if bot['has_coin'] else "🔴"
-                    stp = float(_STRATEGY_CONFIG.get('strategy_tp_roi', 0.0) or 0.0)
-                    sslv = float(_STRATEGY_CONFIG.get('strategy_sl_roi', 0.0) or 0.0)
-                    tp_sl_str = f"TP chiến lược:{stp}%" if stp > 0 else (f"TP bot:{bot['tp']}%" if bot['tp'] else "TP:Tắt")
-                    tp_sl_str += f" SL chiến lược:{sslv}%" if sslv > 0 else (f" SL bot:{bot['sl']}%" if bot['sl'] else " SL:Tắt")
+                    ltp = float(_STRATEGY_CONFIG.get('long_tp_roi_pct', 0) or 0)
+                    lsl = float(_STRATEGY_CONFIG.get('long_sl_roi_pct', 0) or 0)
+                    stp = float(_STRATEGY_CONFIG.get('short_tp_roi_pct', 0) or 0)
+                    sslv = float(_STRATEGY_CONFIG.get('short_sl_roi_pct', 0) or 0)
+                    tp_sl_str = f"BUY TP/SL:{ltp:g}/{lsl:g} | SELL TP/SL:{stp:g}/{sslv:g}"
                     summary += f"{status_emoji} **bot_{bot['index']}** {tp_sl_str}\n"
                     summary += f"   💰 Đòn bẩy: {bot['leverage']}x | Vốn: {bot['percent']}%\n"
                     try:
@@ -3754,15 +4800,15 @@ class BotManager:
 
     def send_main_menu(self, chat_id):
         welcome = (
-            "🤖 <b>BOT GIAO DỊCH FUTURES - RELATIVE CANDLE</b>\n\n"
+            "🤖 <b>BOT FUTURES LIVE — EMA + VOLUME + POSTGRESQL</b>\n\n"
             "🎯 <b>CƠ CHẾ HOẠT ĐỘNG:</b>\n"
-            "• Tín hiệu vào lệnh dựa trên trạng thái tương đối của nến hiện tại và nến trước.\n"
-            "• Điều kiện mềm: hướng nến và close là chính; volume, range và taker chỉ cộng điểm.\n"
-            "• Bot động chọn một coin hợp lệ rồi chờ BUY/SELL theo nến tương đối.\n"
-            "• Khi đang có vị thế, bot KHÔNG đảo chiều theo tín hiệu.\n"
-            "• Lệnh chỉ thoát bằng TP/SL hoặc bảo vệ lợi nhuận tụt từ đỉnh.\n"
-            "• TP/SL trong mục Chiến lược có thể chỉnh sau khi bot đã vào lệnh.\n\n"
-            "📌 <b>LƯU Ý:</b> Đây vẫn là chiến lược Futures rủi ro cao; hãy chạy vốn nhỏ để kiểm thử trước."
+            "• Tín hiệu mở lệnh chỉ dùng nến đã đóng, EMA, volume, cấu trúc nến và taker flow.\n"
+            "• BUY và SELL có toàn bộ cấu hình quản lý riêng trên Telegram.\n"
+            "• DCA BUY khi giá giảm X% từ lần khớp gần nhất; DCA SELL khi giá tăng X%.\n"
+            "• TP, SL, emergency stop, bảo vệ lời, reverse, thoát tín hiệu ngược và cân bằng hướng đều tách riêng.\n"
+            "• PostgreSQL Railway lưu cấu hình, trạng thái DCA và lịch sử OPEN/DCA/CLOSE/REVERSE.\n"
+            "• Sau restart, bot nối lại các vị thế thật đang mở và không tự mở lệnh mới từ bot khôi phục.\n\n"
+            "📌 <b>LƯU Ý:</b> Đây là LIVE Futures dùng tiền thật. Hãy thử bằng Testnet hoặc vốn rất nhỏ và tắt quyền rút tiền của API key."
         )
         send_telegram(welcome, chat_id=chat_id, reply_markup=create_main_menu(),
                      bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
@@ -3804,17 +4850,16 @@ class BotManager:
             created_count += 1
 
         if created_count > 0:
-            tp_info = f"🎯 TP: {tp}%" if tp else "🎯 TP: Tắt"
-            sl_info = f"🛡️ SL: {sl}%" if sl else "🛡️ SL: Tắt"
-            success_msg = (f"✅ <b>ĐÃ TẠO {created_count} BOT RELATIVE CANDLE</b>\n\n"
+            success_msg = (f"✅ <b>ĐÃ TẠO {created_count} BOT LIVE EMA + VOLUME</b>\n\n"
                            f"🎯 Chiến lược: {strategy_type}\n💰 Đòn bẩy: {lev}x\n"
-                           f"📈 % Số dư: {percent}%\n{tp_info}\n{sl_info}\n"
+                           f"📈 % Số dư lệnh đầu: {percent}%\n"
+                           f"🎯 TP/SL/DCA lấy theo cấu hình BUY/SELL riêng\n"
                            f"🔧 Chế độ: {bot_mode}\n🔢 Số bot: {created_count}\n")
             if bot_mode == 'static' and symbol:
                 success_msg += f"🔗 Coin ban đầu: {symbol}\n"
             else:
                 success_msg += f"🔗 Coin: Tự động chọn random một coin hợp lệ (USDT/USDC)\n"
-            success_msg += "🎯 Tín hiệu nến tương đối; thoát bằng TP/SL và bảo vệ lợi nhuận.\n"
+            success_msg += "🎯 Tín hiệu dùng nến đã đóng; quản lý BUY/SELL riêng gồm TP/SL/DCA/reverse/cân bằng.\n"
             self.log(success_msg)
             return True
         else:
@@ -3931,12 +4976,67 @@ class BotManager:
         user_state = self.user_states.get(chat_id, {})
         current_step = user_state.get('step')
 
-        strategy_key_map = {
-            '✏️ TP chiến lược': ('strategy_tp_roi', 'TP ROI dùng realtime, có thể chỉnh sau khi đã vào lệnh. 0 = tắt.'),
-            '✏️ SL chiến lược': ('strategy_sl_roi', 'SL ROI dùng realtime, có thể chỉnh sau khi đã vào lệnh. 0 = tắt.'),
-            '✏️ Bảo vệ lợi nhuận': ('profit_protect_enabled', '1 = bật bảo vệ lợi nhuận tụt từ đỉnh, 0 = tắt.'),
-            '✏️ ROI bắt đầu bảo vệ': ('profit_protect_start_roi', 'ROI từng đạt từ mức này trở lên thì bắt đầu bảo vệ lợi nhuận.'),
-            '✏️ ROI tụt từ đỉnh để đóng': ('profit_protect_pullback_roi', 'Khi ROI tụt từ đỉnh xuống mức này thì đóng.'),
+        profit_protect_key_map = {
+            '✏️ Bảo vệ BUY bật/tắt': ('enable_profit_protect_long', '1 = bật bảo vệ lời BUY; 0 = tắt.'),
+            '✏️ Bảo vệ SELL bật/tắt': ('enable_profit_protect_short', '1 = bật bảo vệ lời SELL; 0 = tắt.'),
+            '✏️ ROI bắt đầu BUY': ('long_protect_start_roi_pct', 'BUY đạt ROI này mới bắt đầu ghi nhận đỉnh.'),
+            '✏️ ROI bắt đầu SELL': ('short_protect_start_roi_pct', 'SELL đạt ROI này mới bắt đầu ghi nhận đỉnh.'),
+            '✏️ Tụt đỉnh BUY': ('long_protect_pullback_roi_pct', 'BUY tụt bao nhiêu điểm ROI từ đỉnh thì đóng.'),
+            '✏️ Tụt đỉnh SELL': ('short_protect_pullback_roi_pct', 'SELL tụt bao nhiêu điểm ROI từ đỉnh thì đóng.'),
+        }
+
+        tp_sl_key_map = {
+            '✏️ TP BUY': ('long_tp_roi_pct', 'TP BUY/LONG theo ROI margin. 0 = tắt.'),
+            '✏️ SL BUY': ('long_sl_roi_pct', 'SL BUY/LONG theo ROI margin. 0 = tắt.'),
+            '✏️ Emergency BUY': ('long_emergency_stop_roi_pct', 'Emergency stop BUY theo ROI. 0 = tắt.'),
+            '✏️ TP SELL': ('short_tp_roi_pct', 'TP SELL/SHORT theo ROI margin. 0 = tắt.'),
+            '✏️ SL SELL': ('short_sl_roi_pct', 'SL SELL/SHORT theo ROI margin. 0 = tắt.'),
+            '✏️ Emergency SELL': ('short_emergency_stop_roi_pct', 'Emergency stop SELL theo ROI. 0 = tắt.'),
+            '✏️ Max giữ BUY': ('long_max_hold_seconds', 'Giữ BUY tối đa bao nhiêu giây. 0 = không giới hạn.'),
+            '✏️ Max giữ SELL': ('short_max_hold_seconds', 'Giữ SELL tối đa bao nhiêu giây. 0 = không giới hạn.'),
+        }
+
+        dca_key_map = {
+            '✏️ Nhồi BUY bật/tắt': ('enable_dca_long', '1 = bật nhồi BUY; 0 = tắt.'),
+            '✏️ Nhồi SELL bật/tắt': ('enable_dca_short', '1 = bật nhồi SELL; 0 = tắt.'),
+            '✏️ Giá ngược BUY %': ('long_dca_trigger_price_pct', 'Giá giảm bao nhiêu % từ GIÁ KHỚP GẦN NHẤT thì nhồi BUY.'),
+            '✏️ Giá ngược SELL %': ('short_dca_trigger_price_pct', 'Giá tăng bao nhiêu % từ GIÁ KHỚP GẦN NHẤT thì nhồi SELL.'),
+            '✏️ Hệ số vốn BUY': ('long_dca_order_multiplier', 'Vốn nhồi BUY = vốn lần vào gần nhất × hệ số này. Ví dụ 1.5.'),
+            '✏️ Hệ số vốn SELL': ('short_dca_order_multiplier', 'Vốn nhồi SELL = vốn lần vào gần nhất × hệ số này. Ví dụ 1.5.'),
+            '✏️ Số lần nhồi BUY': ('long_max_dca_steps', 'Số lần nhồi BUY tối đa.'),
+            '✏️ Số lần nhồi SELL': ('short_max_dca_steps', 'Số lần nhồi SELL tối đa.'),
+            '✏️ Giãn cách nhồi BUY': ('long_dca_min_seconds_between_adds', 'Số giây tối thiểu giữa hai lần nhồi BUY.'),
+            '✏️ Giãn cách nhồi SELL': ('short_dca_min_seconds_between_adds', 'Số giây tối thiểu giữa hai lần nhồi SELL.'),
+        }
+
+        balance_key_map = {
+            '✏️ Cân bằng BUY bật/tắt': ('enable_side_balance_buy', '1 = bật cân bằng hướng BUY; 0 = tắt.'),
+            '✏️ Cân bằng SELL bật/tắt': ('enable_side_balance_sell', '1 = bật cân bằng hướng SELL; 0 = tắt.'),
+            '✏️ Mode cân bằng BUY': ('buy_side_balance_mode', 'filter hoặc override.'),
+            '✏️ Mode cân bằng SELL': ('sell_side_balance_mode', 'filter hoặc override.'),
+            '✏️ Ngưỡng cân bằng BUY': ('buy_side_balance_threshold', 'Tỷ lệ SHORT/LONG từ mức này thì ưu tiên BUY.'),
+            '✏️ Ngưỡng cân bằng SELL': ('sell_side_balance_threshold', 'Tỷ lệ LONG/SHORT từ mức này thì ưu tiên SELL.'),
+            '✏️ Score override BUY': ('buy_balance_override_min_signal_score', 'Điểm BUY tối thiểu khi dùng override.'),
+            '✏️ Score override SELL': ('sell_balance_override_min_signal_score', 'Điểm SELL tối thiểu khi dùng override.'),
+            '✏️ Max vị thế BUY': ('max_long_positions', 'Số vị thế BUY tối đa.'),
+            '✏️ Max vị thế SELL': ('max_short_positions', 'Số vị thế SELL tối đa.'),
+            '✏️ Max notional BUY %': ('max_long_notional_pct', 'Tổng notional BUY tối đa theo % margin balance.'),
+            '✏️ Max notional SELL %': ('max_short_notional_pct', 'Tổng notional SELL tối đa theo % margin balance.'),
+            '✏️ Max margin/symbol BUY %': ('long_max_total_margin_per_symbol_pct', 'Margin tối đa mỗi coin BUY theo % margin balance.'),
+            '✏️ Max margin/symbol SELL %': ('short_max_total_margin_per_symbol_pct', 'Margin tối đa mỗi coin SELL theo % margin balance.'),
+        }
+
+        reverse_key_map = {
+            '✏️ Reverse mode BUY': ('long_reverse_mode', 'none, immediate hoặc confirmed sau khi đóng BUY.'),
+            '✏️ Reverse mode SELL': ('short_reverse_mode', 'none, immediate hoặc confirmed sau khi đóng SELL.'),
+            '✏️ Reverse score BUY': ('long_reverse_min_score', 'Điểm SELL tối thiểu để đảo chiều sau vị thế BUY.'),
+            '✏️ Reverse score SELL': ('short_reverse_min_score', 'Điểm BUY tối thiểu để đảo chiều sau vị thế SELL.'),
+            '✏️ Max reverse BUY': ('long_max_reverse_count', 'Số lần đảo chiều tối đa bắt đầu từ vị thế BUY.'),
+            '✏️ Max reverse SELL': ('short_max_reverse_count', 'Số lần đảo chiều tối đa bắt đầu từ vị thế SELL.'),
+            '✏️ Thoát ngược BUY bật/tắt': ('long_enable_exit_on_opposite_signal', '1 = đóng BUY khi SELL đủ mạnh; 0 = tắt.'),
+            '✏️ Thoát ngược SELL bật/tắt': ('short_enable_exit_on_opposite_signal', '1 = đóng SELL khi BUY đủ mạnh; 0 = tắt.'),
+            '✏️ Score thoát ngược BUY': ('long_opposite_exit_min_score', 'Điểm SELL tối thiểu để đóng BUY.'),
+            '✏️ Score thoát ngược SELL': ('short_opposite_exit_min_score', 'Điểm BUY tối thiểu để đóng SELL.'),
         }
 
         signal_key_map = {
@@ -3963,7 +5063,23 @@ class BotManager:
             '✏️ Min Trades': 'min_24h_trade_count',
             '✏️ Min Abs Change %': 'min_abs_24h_change_pct',
             '✏️ Max Abs Change %': 'max_abs_24h_change_pct',
+            '✏️ Max Spread %': 'max_spread_pct',
+            '✏️ Top coin quét': 'scan_top_coin_limit',
+            '✏️ Coin chấm tín hiệu': 'max_signal_eval_coins',
         }
+
+        global_risk_key_map = {
+            '✏️ Bật/tắt giao dịch': ('trading_enabled', '1 = cho phép OPEN/DCA; 0 = ngừng lệnh mới nhưng vẫn quản lý và đóng vị thế.'),
+            '✏️ Max vị thế tổng': ('max_positions', 'Số vị thế tối đa trên toàn tài khoản.'),
+            '✏️ Max notional tổng %': ('max_total_notional_pct', 'Tổng notional LONG + SHORT tối đa theo % margin balance.'),
+            '✏️ Margin mode': ('margin_type', 'ISOLATED hoặc CROSSED.'),
+            '✏️ One-way mode': ('ensure_one_way_mode', '1 = kiểm tra/ép One-way Mode; 0 = không ép.'),
+            '✏️ Cooldown sau đóng': ('cooldown_after_close_seconds', 'Số giây chờ trước khi giao dịch lại coin sau đóng.'),
+            '✏️ Blacklist TP/SL': ('blacklist_after_tp_sl_seconds', 'Số giây chặn coin sau TP/SL/bảo vệ lời.'),
+        }
+
+
+
 
         if text == "📊 Danh sách Bot":
             if not self.bots:
@@ -4049,149 +5165,327 @@ class BotManager:
                          bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
 
         elif current_step == 'waiting_strategy_config':
-            if text in ('📊 Xem tham số chiến lược', '📊 Xem cấu hình chiến lược'):
+            if text in ('📊 Xem toàn bộ tham số', '📊 Xem tham số chiến lược', '📊 Xem cấu hình chiến lược'):
                 send_telegram(get_strategy_config_text(), chat_id=chat_id, reply_markup=create_strategy_config_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
             elif text in ('🔄 Reset chiến lược', '♻️ Reset tham số chiến lược', '🔄 Reset chiến lược mặc định'):
+                old_cfg = _STRATEGY_CONFIG.get_all()
                 _STRATEGY_CONFIG.reset()
-                send_telegram("✅ Đã reset tham số chiến lược về mặc định.\n\n" + get_strategy_config_text(),
-                             chat_id=chat_id, reply_markup=create_strategy_config_keyboard(),
+                if _LIVE_DB.configured and not _persist_strategy_config():
+                    _STRATEGY_CONFIG.update(**old_cfg)
+                    note = f'❌ Không lưu được PostgreSQL: {_LIVE_DB.last_error}'
+                else:
+                    note = '✅ Đã reset tham số chiến lược về mặc định.'
+                send_telegram(note + '\n\n' + get_strategy_config_text(), chat_id=chat_id,
+                             reply_markup=create_strategy_config_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
-            elif text == "📡 Cấu hình tín hiệu BUY/SELL":
+            elif text in ('📡 Tín hiệu BUY/SELL', '📡 Cấu hình tín hiệu BUY/SELL'):
                 self.user_states[chat_id] = {'step': 'waiting_signal_config'}
-                send_telegram("📡 Chọn tham số tín hiệu cần chỉnh. BUY đang được đặt khó hơn SELL:", chat_id=chat_id,
+                send_telegram('📡 Chọn tham số tín hiệu cần chỉnh:', chat_id=chat_id,
                              reply_markup=create_signal_config_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
-            elif text == "⚙️ Bộ lọc coin (khối lượng, giá,...)":
+            elif text == '🛡️ Bảo vệ lợi nhuận':
+                self.user_states[chat_id] = {'step': 'waiting_profit_config'}
+                send_telegram(get_profit_protect_text(), chat_id=chat_id,
+                             reply_markup=create_profit_protect_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            elif text == '🎯 TP/SL BUY/SELL':
+                self.user_states[chat_id] = {'step': 'waiting_tp_sl_config'}
+                send_telegram(get_tp_sl_config_text(), chat_id=chat_id,
+                             reply_markup=create_tp_sl_config_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            elif text == '➕ Nhồi lệnh BUY/SELL':
+                self.user_states[chat_id] = {'step': 'waiting_dca_config'}
+                send_telegram(get_dca_config_text(), chat_id=chat_id,
+                             reply_markup=create_dca_config_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            elif text == '⚖️ Cân bằng BUY/SELL':
+                self.user_states[chat_id] = {'step': 'waiting_balance_config'}
+                send_telegram(get_balance_config_text(), chat_id=chat_id,
+                             reply_markup=create_balance_config_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            elif text == '🔁 Thoát & đảo chiều BUY/SELL':
+                self.user_states[chat_id] = {'step': 'waiting_reverse_config'}
+                send_telegram(get_reverse_config_text(), chat_id=chat_id,
+                             reply_markup=create_reverse_config_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            elif text in ('🧱 Risk chung', '🛡️ Risk chung'):
+                self.user_states[chat_id] = {'step': 'waiting_global_config'}
+                send_telegram(get_global_risk_text(), chat_id=chat_id,
+                             reply_markup=create_global_risk_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            elif text in ('🔎 Lọc giá & coin', '⚙️ Bộ lọc coin (khối lượng, giá,...)'):
                 self.user_states[chat_id] = {'step': 'waiting_filter_config'}
-                send_telegram("🔧 Chọn tham số bộ lọc coin để chỉnh sửa:", chat_id=chat_id,
+                send_telegram(get_filter_config_text(), chat_id=chat_id,
                              reply_markup=create_filter_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
-            elif text in strategy_key_map:
-                key, help_text = strategy_key_map[text]
-                self.user_states[chat_id] = {'step': 'waiting_strategy_value', 'strategy_key': key}
-                send_telegram(f"✏️ Nhập giá trị mới cho <b>{key}</b>\n{help_text}", chat_id=chat_id,
-                             reply_markup=create_strategy_value_keyboard(),
+            elif text == '🗄️ Trạng thái Database':
+                _LIVE_DB.ping(force=True)
+                msg = (
+                    '🗄️ <b>POSTGRESQL RAILWAY</b>\n\n'
+                    f'• Trạng thái: {_LIVE_DB.status_text()}\n'
+                    f'• Instance: {_LIVE_DB.instance_name}\n'
+                    f"• Bắt buộc DB trước OPEN/DCA: {'CÓ' if _LIVE_DB.required_for_new_orders else 'KHÔNG'}\n"
+                    f"• DATABASE_URL: {'ĐÃ CÓ' if _LIVE_DB.configured else 'CHƯA CÓ'}"
+                )
+                send_telegram(msg, chat_id=chat_id, reply_markup=create_strategy_config_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            elif text == '🔙 Quay lại menu chính':
+                self.user_states[chat_id] = {}
+                send_telegram('🔙 Menu chính', chat_id=chat_id, reply_markup=create_main_menu(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
             else:
-                send_telegram("⚠️ Chọn tham số cần chỉnh.", chat_id=chat_id, reply_markup=create_strategy_config_keyboard(),
+                send_telegram('⚠️ Chọn tham số cần chỉnh.', chat_id=chat_id,
+                             reply_markup=create_strategy_config_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+
+        elif current_step in ('waiting_profit_config', 'waiting_tp_sl_config', 'waiting_dca_config', 'waiting_balance_config', 'waiting_reverse_config'):
+            if text == '🔙 Quay lại cấu hình chiến lược':
+                self.user_states[chat_id] = {'step': 'waiting_strategy_config'}
+                send_telegram('🔙 Quay lại menu chiến lược.', chat_id=chat_id,
+                             reply_markup=create_strategy_config_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+                return
+
+            if current_step == 'waiting_profit_config':
+                mapping, value_step, keyboard = profit_protect_key_map, 'waiting_profit_value', create_profit_protect_keyboard()
+            elif current_step == 'waiting_tp_sl_config':
+                mapping, value_step, keyboard = tp_sl_key_map, 'waiting_tp_sl_value', create_tp_sl_config_keyboard()
+            elif current_step == 'waiting_dca_config':
+                mapping, value_step, keyboard = dca_key_map, 'waiting_dca_value', create_dca_config_keyboard()
+            elif current_step == 'waiting_balance_config':
+                mapping, value_step, keyboard = balance_key_map, 'waiting_balance_value', create_balance_config_keyboard()
+            else:
+                mapping, value_step, keyboard = reverse_key_map, 'waiting_reverse_value', create_reverse_config_keyboard()
+
+            if text in mapping:
+                key, help_text = mapping[text]
+                self.user_states[chat_id] = {'step': value_step, 'strategy_key': key}
+                send_telegram(f'✏️ Nhập giá trị mới cho <b>{key}</b>\n{help_text}', chat_id=chat_id,
+                             reply_markup=create_management_value_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            else:
+                send_telegram('⚠️ Hãy chọn một tham số trong nhóm này.', chat_id=chat_id,
+                             reply_markup=keyboard,
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+
+        elif current_step == 'waiting_global_config':
+            if text == '🔙 Quay lại cấu hình chiến lược':
+                self.user_states[chat_id] = {'step': 'waiting_strategy_config'}
+                send_telegram('🔙 Quay lại menu chiến lược.', chat_id=chat_id,
+                             reply_markup=create_strategy_config_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+                return
+            if text in global_risk_key_map:
+                key, help_text = global_risk_key_map[text]
+                self.user_states[chat_id] = {'step': 'waiting_global_value', 'strategy_key': key}
+                send_telegram(f'✏️ Nhập giá trị mới cho <b>{key}</b>\n{help_text}', chat_id=chat_id,
+                             reply_markup=create_global_value_keyboard(),
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            else:
+                send_telegram('⚠️ Chọn tham số risk chung cần chỉnh.', chat_id=chat_id,
+                             reply_markup=create_global_risk_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
 
         elif current_step == 'waiting_signal_config':
-            if text == "🔙 Quay lại cấu hình chiến lược":
+            if text == '🔙 Quay lại cấu hình chiến lược':
                 self.user_states[chat_id] = {'step': 'waiting_strategy_config'}
-                send_telegram("🔙 Quay lại menu chiến lược.", chat_id=chat_id,
+                send_telegram('🔙 Quay lại menu chiến lược.', chat_id=chat_id,
                              reply_markup=create_strategy_config_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
                 return
             if text in signal_key_map:
                 key, help_text = signal_key_map[text]
                 self.user_states[chat_id] = {'step': 'waiting_signal_value', 'strategy_key': key}
-                send_telegram(f"✏️ Nhập giá trị mới cho <b>{key}</b>\n{help_text}", chat_id=chat_id,
+                send_telegram(f'✏️ Nhập giá trị mới cho <b>{key}</b>\n{help_text}', chat_id=chat_id,
                              reply_markup=create_signal_value_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
             else:
-                send_telegram("⚠️ Chọn tham số tín hiệu cần chỉnh.", chat_id=chat_id,
+                send_telegram('⚠️ Chọn tham số tín hiệu cần chỉnh.', chat_id=chat_id,
                              reply_markup=create_signal_config_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
 
         elif current_step == 'waiting_filter_config':
-            if text == "🔙 Quay lại cấu hình chiến lược":
+            if text == '🔙 Quay lại cấu hình chiến lược':
                 self.user_states[chat_id] = {'step': 'waiting_strategy_config'}
-                send_telegram("🔙 Quay lại menu chiến lược.", chat_id=chat_id,
+                send_telegram('🔙 Quay lại menu chiến lược.', chat_id=chat_id,
                              reply_markup=create_strategy_config_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
                 return
             if text in filter_key_map:
                 key = filter_key_map[text]
                 self.user_states[chat_id] = {'step': 'waiting_filter_value', 'strategy_key': key}
-                send_telegram(f"✏️ Nhập giá trị mới cho <b>{key}</b> (0 = tắt lọc):", chat_id=chat_id,
+                send_telegram(f'✏️ Nhập giá trị mới cho <b>{key}</b> (0 = tắt lọc):', chat_id=chat_id,
                              reply_markup=create_strategy_value_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
             else:
-                send_telegram("⚠️ Chọn tham số cần chỉnh.", chat_id=chat_id,
+                send_telegram(get_filter_config_text() + '\n\n⚠️ Chọn tham số cần chỉnh.', chat_id=chat_id,
                              reply_markup=create_filter_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
 
-        elif current_step in ('waiting_strategy_value', 'waiting_filter_value', 'waiting_signal_value'):
-            if text == "❌ Hủy bỏ":
-                self.user_states[chat_id] = {}
-                send_telegram("❌ Đã hủy.", chat_id=chat_id, reply_markup=create_main_menu(),
+        elif current_step in ('waiting_strategy_value', 'waiting_filter_value', 'waiting_signal_value',
+                              'waiting_profit_value', 'waiting_tp_sl_value', 'waiting_dca_value',
+                              'waiting_balance_value', 'waiting_reverse_value', 'waiting_global_value'):
+            if text == '❌ Hủy bỏ':
+                if current_step == 'waiting_profit_value':
+                    self.user_states[chat_id] = {'step': 'waiting_profit_config'}
+                    keyboard = create_profit_protect_keyboard()
+                elif current_step == 'waiting_tp_sl_value':
+                    self.user_states[chat_id] = {'step': 'waiting_tp_sl_config'}
+                    keyboard = create_tp_sl_config_keyboard()
+                elif current_step == 'waiting_dca_value':
+                    self.user_states[chat_id] = {'step': 'waiting_dca_config'}
+                    keyboard = create_dca_config_keyboard()
+                elif current_step == 'waiting_balance_value':
+                    self.user_states[chat_id] = {'step': 'waiting_balance_config'}
+                    keyboard = create_balance_config_keyboard()
+                elif current_step == 'waiting_reverse_value':
+                    self.user_states[chat_id] = {'step': 'waiting_reverse_config'}
+                    keyboard = create_reverse_config_keyboard()
+                elif current_step == 'waiting_global_value':
+                    self.user_states[chat_id] = {'step': 'waiting_global_config'}
+                    keyboard = create_global_risk_keyboard()
+                elif current_step == 'waiting_signal_value':
+                    self.user_states[chat_id] = {'step': 'waiting_signal_config'}
+                    keyboard = create_signal_config_keyboard()
+                elif current_step == 'waiting_filter_value':
+                    self.user_states[chat_id] = {'step': 'waiting_filter_config'}
+                    keyboard = create_filter_keyboard()
+                else:
+                    self.user_states[chat_id] = {'step': 'waiting_strategy_config'}
+                    keyboard = create_strategy_config_keyboard()
+                send_telegram('❌ Đã hủy thay đổi.', chat_id=chat_id, reply_markup=keyboard,
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
                 return
             try:
                 key = user_state.get('strategy_key')
+                if key not in _STRATEGY_CONFIG.get_all():
+                    raise ValueError('unknown config key')
+                old_value = _STRATEGY_CONFIG.get(key)
+                raw = str(text).strip()
                 if key in ('signal_interval', 'current_interval', 'compare_interval', 'market_interval', 'extreme_interval'):
-                    val = _normalize_interval(text)
-                    if val != text.strip().lower():
-                        raise ValueError
-                    _STRATEGY_CONFIG.update(**{key: val})
+                    val = _normalize_interval(raw)
+                    if val != raw.lower():
+                        raise ValueError('invalid interval')
+                elif key in StrategyConfig.STRING_KEYS:
+                    val = raw.lower()
+                    if key in {'reverse_mode', 'long_reverse_mode', 'short_reverse_mode'} and val not in {'none','immediate','confirmed'}:
+                        raise ValueError('reverse mode phải là none/immediate/confirmed')
+                    if key in {'side_balance_mode', 'buy_side_balance_mode', 'sell_side_balance_mode'} and val not in {'filter','override'}:
+                        raise ValueError('balance mode phải là filter/override')
+                    if key == 'margin_type':
+                        val = raw.upper()
+                        if val not in {'ISOLATED','CROSSED'}:
+                            raise ValueError('margin mode phải là ISOLATED/CROSSED')
+                    if key == 'quote_asset':
+                        val = raw.upper()
                 else:
-                    val = float(text)
-                    # Các key số nguyên và ràng buộc riêng cho bộ tín hiệu.
-                    int_keys = {'max_reverse_count', 'entry_min_trades', 'exit_min_trades', 'scan_top_coin_limit',
-                                'confirm_min_trades', 'max_signal_eval_coins', 'min_24h_trade_count',
-                                'target_leverage', 'min_allowed_leverage', 'max_consecutive_losses_before_pause',
-                                'max_hold_seconds', 'coin_cooldown_after_loss_sec', 'ema_fast_period',
-                                'ema_slow_period', 'signal_volume_lookback'}
-                    if key in int_keys:
+                    val = float(raw)
+                    if key in StrategyConfig.INT_KEYS:
                         val = int(val)
-                        if val < 0 or val > 10000:
-                            raise ValueError
-                    else:
-                        if val < 0:
-                            raise ValueError
-                        if key in ('buy_taker_ratio_min', 'sell_taker_ratio_min', 'exit_taker_ratio_min',
-                                   'absorption_taker_ratio', 'buy_min_close_position', 'sell_max_close_position') and val > 1:
-                            raise ValueError
-                        if key in ('buy_require_ema_trend', 'sell_require_ema_trend') and val not in (0, 1):
-                            raise ValueError
-                        if key in ('buy_min_volume_ratio', 'sell_min_volume_ratio') and val > 10:
-                            raise ValueError
-                        if key in ('buy_score_threshold', 'sell_score_threshold', 'buy_min_score_gap', 'sell_min_score_gap') and val > 50:
-                            raise ValueError
+                        max_allowed = 100 if key in {
+                            'long_max_dca_steps','short_max_dca_steps','max_dca_steps',
+                            'long_max_reverse_count','short_max_reverse_count','max_reverse_count',
+                            'max_positions','max_long_positions','max_short_positions'} else 1_000_000
+                        if val < 0 or val > max_allowed:
+                            raise ValueError('integer out of range')
+                    elif val < 0:
+                        raise ValueError('không nhận số âm')
 
-                    # Kiểm tra quan hệ EMA trước khi ghi cấu hình.
-                    current_cfg = _STRATEGY_CONFIG.get_all()
-                    proposed_fast = val if key == 'ema_fast_period' else int(current_cfg.get('ema_fast_period', 9))
-                    proposed_slow = val if key == 'ema_slow_period' else int(current_cfg.get('ema_slow_period', 21))
-                    if proposed_fast < 2 or proposed_slow < 3 or proposed_fast >= proposed_slow:
-                        raise ValueError
-                    if key == 'signal_volume_lookback' and not (2 <= val <= 200):
-                        raise ValueError
-                    _STRATEGY_CONFIG.update(**{key: val})
+                    boolean_keys = {
+                        'btc_context_enabled','enable_dca_long','enable_dca_short',
+                        'enable_profit_protect_long','enable_profit_protect_short','profit_protect_enabled',
+                        'long_enable_exit_on_opposite_signal','short_enable_exit_on_opposite_signal',
+                        'enable_exit_on_opposite_signal','enable_side_balance_buy','enable_side_balance_sell',
+                        'enable_side_balance','ensure_one_way_mode','trading_enabled',
+                        'buy_require_ema_trend','sell_require_ema_trend'}
+                    if key in boolean_keys and val not in (0, 1):
+                        raise ValueError('tham số bật/tắt chỉ nhận 0 hoặc 1')
+                    if key in {'buy_min_close_position','sell_max_close_position','buy_taker_ratio_min','sell_taker_ratio_min'} and val > 1:
+                        raise ValueError('ratio phải <= 1')
+                    if key in {'buy_min_volume_ratio','sell_min_volume_ratio'} and val > 10:
+                        raise ValueError('volume ratio quá lớn')
+                    if key in {'long_dca_trigger_price_pct','short_dca_trigger_price_pct'} and not (0.01 <= val <= 100):
+                        raise ValueError('DCA trigger phải 0.01..100')
+                    if key in {'long_dca_add_margin_pct','short_dca_add_margin_pct'} and not (0.01 <= val <= 10000):
+                        raise ValueError('lượng DCA phải 0.01..10000')
+                    if key in {'long_dca_step_multiplier','short_dca_step_multiplier',
+                                'long_dca_order_multiplier','short_dca_order_multiplier'} and not (0.01 <= val <= 100):
+                        raise ValueError('hệ số vốn nhồi phải 0.01..100')
+                    if key in {'buy_side_balance_threshold','sell_side_balance_threshold','side_balance_threshold'} and val < 1:
+                        raise ValueError('ngưỡng cân bằng phải >= 1')
 
-                # Đổi khung/EMA/lookback cần nạp lại lịch sử và WebSocket cho coin đang chạy.
+                current_cfg = _STRATEGY_CONFIG.get_all()
+                fast = int(val) if key == 'ema_fast_period' else int(current_cfg.get('ema_fast_period', 9))
+                slow = int(val) if key == 'ema_slow_period' else int(current_cfg.get('ema_slow_period', 21))
+                if fast < 2 or slow < 3 or fast >= slow:
+                    raise ValueError('EMA nhanh phải >=2 và nhỏ hơn EMA chậm')
+                if key == 'signal_volume_lookback' and not (2 <= int(val) <= 200):
+                    raise ValueError('lookback phải 2..200')
+
+                _STRATEGY_CONFIG.update(**{key: val})
+                if _LIVE_DB.configured and not _persist_strategy_config():
+                    _STRATEGY_CONFIG.update(**{key: old_value})
+                    raise RuntimeError(f'Không lưu được PostgreSQL: {_LIVE_DB.last_error}')
+
                 if (current_step == 'waiting_signal_value' and self.kline_manager
-                        and key in ('current_interval', 'ema_fast_period', 'ema_slow_period', 'signal_volume_lookback')):
-                    # BotManager không có symbol_data/_on_kline_update; nạp lại qua từng BaseBot.
+                        and key in ('current_interval','ema_fast_period','ema_slow_period','signal_volume_lookback')):
                     for bot in list(self.bots.values()):
                         for active_symbol in list(getattr(bot, 'active_symbols', []) or []):
                             try:
                                 self.kline_manager.remove_symbol(active_symbol)
                                 self.kline_manager.add_symbol(active_symbol, bot._on_kline_update)
-                            except Exception as reload_err:
-                                logger.error(f"Lỗi nạp lại dữ liệu tín hiệu {active_symbol}: {reload_err}")
-                # Quay lại menu tương ứng
-                if current_step == 'waiting_filter_value':
-                    self.user_states[chat_id] = {'step': 'waiting_filter_config'}
-                    send_telegram("✅ Đã cập nhật.\n\n" + get_strategy_config_text(), chat_id=chat_id,
-                                 reply_markup=create_filter_keyboard(),
-                                 bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+                            except Exception as reload_error:
+                                logger.error(f'Lỗi nạp lại tín hiệu {active_symbol}: {reload_error}')
+
+                if current_step == 'waiting_profit_value':
+                    self.user_states[chat_id] = {'step': 'waiting_profit_config'}
+                    keyboard = create_profit_protect_keyboard()
+                    message = '✅ Đã cập nhật bảo vệ lợi nhuận.\n\n' + get_profit_protect_text()
+                elif current_step == 'waiting_tp_sl_value':
+                    self.user_states[chat_id] = {'step': 'waiting_tp_sl_config'}
+                    keyboard = create_tp_sl_config_keyboard()
+                    message = '✅ Đã cập nhật TP/SL.\n\n' + get_tp_sl_config_text()
+                elif current_step == 'waiting_dca_value':
+                    self.user_states[chat_id] = {'step': 'waiting_dca_config'}
+                    keyboard = create_dca_config_keyboard()
+                    message = '✅ Đã cập nhật nhồi lệnh.\n\n' + get_dca_config_text()
+                elif current_step == 'waiting_balance_value':
+                    self.user_states[chat_id] = {'step': 'waiting_balance_config'}
+                    keyboard = create_balance_config_keyboard()
+                    message = '✅ Đã cập nhật cân bằng BUY/SELL.\n\n' + get_balance_config_text()
+                elif current_step == 'waiting_reverse_value':
+                    self.user_states[chat_id] = {'step': 'waiting_reverse_config'}
+                    keyboard = create_reverse_config_keyboard()
+                    message = '✅ Đã cập nhật thoát/đảo chiều.\n\n' + get_reverse_config_text()
+                elif current_step == 'waiting_global_value':
+                    self.user_states[chat_id] = {'step': 'waiting_global_config'}
+                    keyboard = create_global_risk_keyboard()
+                    message = '✅ Đã cập nhật risk chung.\n\n' + get_global_risk_text()
                 elif current_step == 'waiting_signal_value':
                     self.user_states[chat_id] = {'step': 'waiting_signal_config'}
-                    send_telegram("✅ Đã cập nhật tín hiệu.\n\n" + get_strategy_config_text(), chat_id=chat_id,
-                                 reply_markup=create_signal_config_keyboard(),
-                                 bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+                    keyboard = create_signal_config_keyboard()
+                    message = '✅ Đã cập nhật tín hiệu.\n\n' + get_strategy_config_text()
+                elif current_step == 'waiting_filter_value':
+                    self.user_states[chat_id] = {'step': 'waiting_filter_config'}
+                    keyboard = create_filter_keyboard()
+                    message = '✅ Đã cập nhật bộ lọc.\n\n' + get_filter_config_text()
                 else:
                     self.user_states[chat_id] = {'step': 'waiting_strategy_config'}
-                    send_telegram("✅ Đã cập nhật.\n\n" + get_strategy_config_text(), chat_id=chat_id,
-                                 reply_markup=create_strategy_config_keyboard(),
-                                 bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
-            except Exception:
-                error_keyboard = create_signal_value_keyboard() if current_step == 'waiting_signal_value' else create_strategy_value_keyboard()
-                send_telegram("⚠️ Giá trị không hợp lệ. Hãy nhập giá trị phù hợp.", chat_id=chat_id,
-                             reply_markup=error_keyboard,
+                    keyboard = create_strategy_config_keyboard()
+                    message = '✅ Đã cập nhật.\n\n' + get_strategy_config_text()
+                send_telegram(message, chat_id=chat_id, reply_markup=keyboard,
+                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+            except Exception as exc:
+                if current_step in ('waiting_profit_value', 'waiting_tp_sl_value', 'waiting_dca_value', 'waiting_balance_value', 'waiting_reverse_value'):
+                    keyboard = create_management_value_keyboard()
+                elif current_step == 'waiting_global_value':
+                    keyboard = create_global_value_keyboard()
+                elif current_step == 'waiting_signal_value':
+                    keyboard = create_signal_value_keyboard()
+                else:
+                    keyboard = create_strategy_value_keyboard()
+                send_telegram(f'⚠️ Giá trị không hợp lệ: {exc}', chat_id=chat_id, reply_markup=keyboard,
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
 
         elif current_step == 'waiting_bot_mode':
@@ -4239,9 +5533,17 @@ class BotManager:
                 if percent <= 0 or percent > 100:
                     raise ValueError
                 user_state['percent'] = percent
-                user_state['step'] = 'waiting_tp'
-                send_telegram("🎯 Nhập TP % ROI sau đòn bẩy, hoặc bỏ qua:", chat_id=chat_id, reply_markup=create_tp_keyboard(),
-                             bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
+                user_state['tp'] = None
+                user_state['sl'] = None
+                if user_state.get('bot_mode') == 'static':
+                    self._finish_bot_creation(chat_id, user_state)
+                else:
+                    user_state['step'] = 'waiting_bot_count'
+                    send_telegram(
+                        "🔢 Nhập số bot muốn tạo. TP/SL/DCA/Reverse dùng cấu hình BUY/SELL riêng:",
+                        chat_id=chat_id, reply_markup=create_bot_count_keyboard(),
+                        bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id
+                    )
             except Exception:
                 send_telegram("⚠️ Vui lòng nhập % hợp lệ.", chat_id=chat_id, reply_markup=create_percent_keyboard(),
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
@@ -4360,11 +5662,11 @@ class BotManager:
                     f"🔧 Chế độ: {bot_mode}\n"
                     f"🔢 Số bot: {bot_count}\n"
                     f"💰 Đòn bẩy: {leverage}x\n"
-                    f"📊 % Số dư: {percent}%\n"
-                    f"🎯 TP: {tp if tp else 'Tắt'}\n"
-                    f"🛡️ SL: {sl if sl else 'Tắt'}\n"
-                    f"🔄 Thoát: chỉ TP/SL hoặc bảo vệ lợi nhuận tụt từ đỉnh\n"
-                    f"⚖️ Điều kiện tín hiệu: BUY khó hơn SELL, chỉnh riêng trong menu chiến lược\n\n"
+                    f"📊 % Số dư cho lệnh đầu: {percent}%\n"
+                    f"🎯 TP/SL: cấu hình BUY và SELL riêng\n"
+                    f"➕ DCA: theo % giá lệch từ lần khớp gần nhất\n"
+                    f"🔄 Reverse, bảo vệ lời và cân bằng: chỉnh riêng BUY/SELL\n"
+                    f"🗄️ Cấu hình/trạng thái DCA: PostgreSQL Railway\n\n"
                     f"{get_strategy_config_text()}"
                 )
                 if bot_mode == 'static' and symbol:
@@ -4382,4 +5684,55 @@ class BotManager:
                         bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
             self.user_states[chat_id] = {}
 
+def run_from_environment():
+    """Railway worker entrypoint. Bot chỉ tạo lệnh sau thao tác Telegram."""
+    values = {
+        'BINANCE_API_KEY': os.getenv('BINANCE_API_KEY', '').strip(),
+        'BINANCE_API_SECRET': os.getenv('BINANCE_API_SECRET', '').strip(),
+        'TELEGRAM_BOT_TOKEN': os.getenv('TELEGRAM_BOT_TOKEN', '').strip(),
+        'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID', '').strip(),
+    }
+    missing = [k for k, v in values.items() if not v]
+    if missing:
+        raise RuntimeError('Thiếu biến môi trường bắt buộc: ' + ', '.join(missing))
+    manager = BotManager(
+        api_key=values['BINANCE_API_KEY'], api_secret=values['BINANCE_API_SECRET'],
+        telegram_bot_token=values['TELEGRAM_BOT_TOKEN'], telegram_chat_id=values['TELEGRAM_CHAT_ID'],
+    )
+    stop_event = threading.Event()
+
+    def _shutdown(signum=None, frame=None):
+        logger.info('Nhận tín hiệu dừng %s', signum)
+        manager.running = False
+        stop_event.set()
+
+    for sig in (getattr(os_signal, 'SIGTERM', None), getattr(os_signal, 'SIGINT', None)):
+        if sig is not None:
+            try:
+                os_signal.signal(sig, _shutdown)
+            except Exception:
+                pass
+    try:
+        while not stop_event.wait(1.0) and manager.running:
+            pass
+    finally:
+        manager.running = False
+        try:
+            manager.stop_all()
+        except Exception:
+            pass
+        try:
+            manager.kline_manager.stop()
+        except Exception:
+            pass
+        try:
+            manager.ws_manager.stop()
+        except Exception:
+            pass
+        _LIVE_DB.release_instance_lock()
+
+
 ssl._create_default_https_context = ssl._create_unverified_context
+
+if __name__ == '__main__':
+    run_from_environment()
