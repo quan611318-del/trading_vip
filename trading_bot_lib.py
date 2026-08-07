@@ -839,6 +839,7 @@ def create_dca_config_keyboard():
     return {
         "keyboard": [
             [{"text": "✏️ Nhồi BUY bật/tắt"}, {"text": "✏️ Nhồi SELL bật/tắt"}],
+            [{"text": "✏️ Kiểu nhồi BUY"}, {"text": "✏️ Kiểu nhồi SELL"}],
             [{"text": "✏️ Giá ngược BUY %"}, {"text": "✏️ Giá ngược SELL %"}],
             [{"text": "✏️ Hệ số vốn BUY"}, {"text": "✏️ Hệ số vốn SELL"}],
             [{"text": "✏️ Số lần nhồi BUY"}, {"text": "✏️ Số lần nhồi SELL"}],
@@ -846,6 +847,17 @@ def create_dca_config_keyboard():
             [{"text": "🔙 Quay lại cấu hình chiến lược"}],
         ],
         "resize_keyboard": True, "one_time_keyboard": False,
+    }
+
+
+def create_dca_strategy_keyboard():
+    """Chỉ dùng khi chọn kiểu DCA; không ảnh hưởng các menu khác."""
+    return {
+        "keyboard": [
+            [{"text": "traditional"}, {"text": "fibonacci"}],
+            [{"text": "❌ Hủy bỏ"}],
+        ],
+        "resize_keyboard": True, "one_time_keyboard": True,
     }
 
 
@@ -1386,6 +1398,13 @@ def _normalize_interval(value):
 def _interval_seconds(interval=None):
     return float(_BINANCE_INTERVAL_SECONDS.get(_normalize_interval(interval), 60.0))
 
+# DCA Fibonacci chuẩn đã thống nhất:
+# - Khoảng giá: Fibonacci ×5 => 5%, 10%, 15%, 25%, 40% so với GIÁ KHỚP GẦN NHẤT.
+# - Vốn nhồi: Fibonacci ×1 => 1, 2, 3, 5, 8 lần VỐN LỆNH BAN ĐẦU.
+# Lệnh ban đầu không tính vào dca_count; vì vậy có đúng 5 bước DCA Fibonacci.
+_FIBONACCI_DCA_SEQUENCE = (1.0, 2.0, 3.0, 5.0, 8.0)
+_FIBONACCI_DCA_PRICE_SCALE = 5.0
+
 class StrategyConfig:
     """Cấu hình LIVE EMA + volume, đồng bộ với bộ tham số của bản PostgreSQL.
 
@@ -1439,6 +1458,10 @@ class StrategyConfig:
         # BUY: giá giảm trigger% từ last_dca_price. SELL: giá tăng trigger%.
         'enable_dca_long': 1.0,
         'enable_dca_short': 0.0,
+        # Chọn cách nhồi riêng từng hướng. traditional = giữ nguyên logic file gốc.
+        # fibonacci = giá Fib×5 và vốn Fib×1 (vốn tính từ initial_margin, không nhân dồn).
+        'long_dca_strategy': 'traditional',
+        'short_dca_strategy': 'traditional',
         'long_dca_trigger_price_pct': 5.0,
         'short_dca_trigger_price_pct': 10.0,
         # Mỗi lần nhồi lấy VỐN LẦN VÀO GẦN NHẤT × hệ số dưới đây.
@@ -1590,8 +1613,9 @@ class StrategyConfig:
     }
     STRING_KEYS = {
         'current_interval', 'signal_interval', 'compare_interval', 'market_interval',
-        'extreme_interval', 'dca_mode', 'reverse_mode', 'long_reverse_mode',
-        'short_reverse_mode', 'side_balance_mode', 'buy_side_balance_mode',
+        'extreme_interval', 'dca_mode', 'long_dca_strategy', 'short_dca_strategy',
+        'reverse_mode', 'long_reverse_mode', 'short_reverse_mode',
+        'side_balance_mode', 'buy_side_balance_mode',
         'sell_side_balance_mode', 'margin_type', 'quote_asset',
     }
 
@@ -1666,6 +1690,7 @@ def _load_strategy_config_from_env():
         'SHORT_EMERGENCY_STOP_ROI_PCT': 'short_emergency_stop_roi_pct',
         'LONG_MAX_HOLD_SECONDS': 'long_max_hold_seconds', 'SHORT_MAX_HOLD_SECONDS': 'short_max_hold_seconds',
         'ENABLE_DCA_LONG': 'enable_dca_long', 'ENABLE_DCA_SHORT': 'enable_dca_short',
+        'LONG_DCA_STRATEGY': 'long_dca_strategy', 'SHORT_DCA_STRATEGY': 'short_dca_strategy',
         'LONG_DCA_TRIGGER_PRICE_PCT': 'long_dca_trigger_price_pct',
         'SHORT_DCA_TRIGGER_PRICE_PCT': 'short_dca_trigger_price_pct',
         'LONG_DCA_ORDER_MULTIPLIER': 'long_dca_order_multiplier',
@@ -1764,12 +1789,24 @@ _initialize_strategy_database()
 
 def get_strategy_config_text():
     c = _STRATEGY_CONFIG.get_all()
+    long_mode = str(c.get('long_dca_strategy', 'traditional')).lower()
+    short_mode = str(c.get('short_dca_strategy', 'traditional')).lower()
+    long_dca_summary = (
+        "Fib giá 5/10/15/25/40%, vốn 1/2/3/5/8×initial, tối đa 5 lần"
+        if long_mode == 'fibonacci' else
+        f"giá giảm {float(c.get('long_dca_trigger_price_pct')):.3f}%, vốn gần nhất ×{float(c.get('long_dca_order_multiplier')):.3f}, tối đa {int(c.get('long_max_dca_steps'))} lần"
+    )
+    short_dca_summary = (
+        "Fib giá 5/10/15/25/40%, vốn 1/2/3/5/8×initial, tối đa 5 lần"
+        if short_mode == 'fibonacci' else
+        f"giá tăng {float(c.get('short_dca_trigger_price_pct')):.3f}%, vốn gần nhất ×{float(c.get('short_dca_order_multiplier')):.3f}, tối đa {int(c.get('short_max_dca_steps'))} lần"
+    )
     return (
         "🎯 <b>CHIẾN LƯỢC LIVE — CHỈNH TRỰC TIẾP TRÊN TELEGRAM</b>\n\n"
         f"📡 Tín hiệu: {c.get('current_interval')} | EMA {int(c.get('ema_fast_period'))}/{int(c.get('ema_slow_period'))} | BUY≥{float(c.get('buy_score_threshold')):.2f} | SELL≥{float(c.get('sell_score_threshold')):.2f}\n"
         f"🎯 BUY TP/SL: {float(c.get('long_tp_roi_pct')):.2f}/{float(c.get('long_sl_roi_pct')):.2f}% ROI | SELL: {float(c.get('short_tp_roi_pct')):.2f}/{float(c.get('short_sl_roi_pct')):.2f}% ROI\n"
-        f"➕ Nhồi BUY: {'BẬT' if float(c.get('enable_dca_long')) >= .5 else 'TẮT'}, giá giảm {float(c.get('long_dca_trigger_price_pct')):.3f}%, vốn gần nhất ×{float(c.get('long_dca_order_multiplier')):.3f}, tối đa {int(c.get('long_max_dca_steps'))} lần\n"
-        f"➕ Nhồi SELL: {'BẬT' if float(c.get('enable_dca_short')) >= .5 else 'TẮT'}, giá tăng {float(c.get('short_dca_trigger_price_pct')):.3f}%, vốn gần nhất ×{float(c.get('short_dca_order_multiplier')):.3f}, tối đa {int(c.get('short_max_dca_steps'))} lần\n"
+        f"➕ Nhồi BUY: {'BẬT' if float(c.get('enable_dca_long')) >= .5 else 'TẮT'} | mode={long_mode} | {long_dca_summary}\n"
+        f"➕ Nhồi SELL: {'BẬT' if float(c.get('enable_dca_short')) >= .5 else 'TẮT'} | mode={short_mode} | {short_dca_summary}\n"
         f"🛡️ Bảo vệ BUY/SELL: {'BẬT' if float(c.get('enable_profit_protect_long')) >= .5 else 'TẮT'}/{'BẬT' if float(c.get('enable_profit_protect_short')) >= .5 else 'TẮT'}\n"
         f"🔎 Giá coin: {float(c.get('min_coin_price')):.8g} → {float(c.get('max_coin_price')):.8g} (0 = không giới hạn) | volume≥{float(c.get('min_24h_volume')):.0f}\n"
         f"🗄️ PostgreSQL: {_LIVE_DB.status_text()}"
@@ -1797,11 +1834,28 @@ def get_tp_sl_config_text():
 
 def get_dca_config_text():
     c = _STRATEGY_CONFIG.get_all()
+    long_mode = str(c.get('long_dca_strategy', 'traditional')).lower()
+    short_mode = str(c.get('short_dca_strategy', 'traditional')).lower()
+    long_desc = (
+        f"FIBONACCI | giá giảm 5/10/15/25/40% từ giá khớp gần nhất | "
+        f"vốn 1/2/3/5/8 × vốn lệnh ban đầu | tối đa 5 lần | cách {int(c.get('long_dca_min_seconds_between_adds'))} giây"
+        if long_mode == 'fibonacci' else
+        f"TRADITIONAL | giá giảm {float(c.get('long_dca_trigger_price_pct')):.4f}% từ giá khớp gần nhất | "
+        f"vốn lần gần nhất ×{float(c.get('long_dca_order_multiplier')):.4f} | tối đa {int(c.get('long_max_dca_steps'))} lần | cách {int(c.get('long_dca_min_seconds_between_adds'))} giây"
+    )
+    short_desc = (
+        f"FIBONACCI | giá tăng 5/10/15/25/40% từ giá khớp gần nhất | "
+        f"vốn 1/2/3/5/8 × vốn lệnh ban đầu | tối đa 5 lần | cách {int(c.get('short_dca_min_seconds_between_adds'))} giây"
+        if short_mode == 'fibonacci' else
+        f"TRADITIONAL | giá tăng {float(c.get('short_dca_trigger_price_pct')):.4f}% từ giá khớp gần nhất | "
+        f"vốn lần gần nhất ×{float(c.get('short_dca_order_multiplier')):.4f} | tối đa {int(c.get('short_max_dca_steps'))} lần | cách {int(c.get('short_dca_min_seconds_between_adds'))} giây"
+    )
     return (
-        "➕ <b>NHỒI LỆNH THEO GIÁ VÀ VỐN LẦN GẦN NHẤT</b>\n\n"
-        f"🟢 BUY: {'BẬT' if float(c.get('enable_dca_long')) >= .5 else 'TẮT'} | giá giảm {float(c.get('long_dca_trigger_price_pct')):.4f}% từ giá khớp gần nhất | vốn lần gần nhất ×{float(c.get('long_dca_order_multiplier')):.4f} | tối đa {int(c.get('long_max_dca_steps'))} lần | cách {int(c.get('long_dca_min_seconds_between_adds'))} giây\n"
-        f"🔴 SELL: {'BẬT' if float(c.get('enable_dca_short')) >= .5 else 'TẮT'} | giá tăng {float(c.get('short_dca_trigger_price_pct')):.4f}% từ giá khớp gần nhất | vốn lần gần nhất ×{float(c.get('short_dca_order_multiplier')):.4f} | tối đa {int(c.get('short_max_dca_steps'))} lần | cách {int(c.get('short_dca_min_seconds_between_adds'))} giây\n\n"
-        "Sau mỗi lần khớp, bot lưu giá khớp và vốn vừa nhồi làm mốc mới, đặt tiếp đúng hướng ban đầu và tăng DCA count."
+        "➕ <b>NHỒI LỆNH — TRADITIONAL / FIBONACCI</b>\n\n"
+        f"🟢 BUY: {'BẬT' if float(c.get('enable_dca_long')) >= .5 else 'TẮT'} | {long_desc}\n"
+        f"🔴 SELL: {'BẬT' if float(c.get('enable_dca_short')) >= .5 else 'TẮT'} | {short_desc}\n\n"
+        "Fibonacci cố định: khoảng giá = Fibonacci ×5; vốn nhồi = Fibonacci ×1 trên VỐN LỆNH BAN ĐẦU. "
+        "TP/SL và toàn bộ cơ chế đóng lệnh vẫn dùng nguyên logic hiện có."
     )
 
 
@@ -4038,19 +4092,31 @@ class BaseBot:
         side = data.get('side')
         if side not in ('BUY', 'SELL') or current_price <= 0:
             return False
+        count = int(data.get('dca_count', 0) or 0)
         if side == 'BUY':
             enabled = float(_STRATEGY_CONFIG.get('enable_dca_long', 1) or 0) >= 0.5
-            max_steps = int(_STRATEGY_CONFIG.get('long_max_dca_steps', 3) or 0)
             min_gap = float(_STRATEGY_CONFIG.get('long_dca_min_seconds_between_adds', 20) or 0)
-            trigger_pct = float(_STRATEGY_CONFIG.get('long_dca_trigger_price_pct', 1) or 0)
+            dca_strategy = str(_STRATEGY_CONFIG.get('long_dca_strategy', 'traditional') or 'traditional').lower()
+            if dca_strategy == 'fibonacci':
+                max_steps = len(_FIBONACCI_DCA_SEQUENCE)
+                trigger_pct = (_FIBONACCI_DCA_SEQUENCE[count] * _FIBONACCI_DCA_PRICE_SCALE
+                               if count < max_steps else 0.0)
+            else:
+                max_steps = int(_STRATEGY_CONFIG.get('long_max_dca_steps', 3) or 0)
+                trigger_pct = float(_STRATEGY_CONFIG.get('long_dca_trigger_price_pct', 1) or 0)
         else:
             enabled = float(_STRATEGY_CONFIG.get('enable_dca_short', 1) or 0) >= 0.5
-            max_steps = int(_STRATEGY_CONFIG.get('short_max_dca_steps', 3) or 0)
             min_gap = float(_STRATEGY_CONFIG.get('short_dca_min_seconds_between_adds', 20) or 0)
-            trigger_pct = float(_STRATEGY_CONFIG.get('short_dca_trigger_price_pct', 1) or 0)
+            dca_strategy = str(_STRATEGY_CONFIG.get('short_dca_strategy', 'traditional') or 'traditional').lower()
+            if dca_strategy == 'fibonacci':
+                max_steps = len(_FIBONACCI_DCA_SEQUENCE)
+                trigger_pct = (_FIBONACCI_DCA_SEQUENCE[count] * _FIBONACCI_DCA_PRICE_SCALE
+                               if count < max_steps else 0.0)
+            else:
+                max_steps = int(_STRATEGY_CONFIG.get('short_max_dca_steps', 3) or 0)
+                trigger_pct = float(_STRATEGY_CONFIG.get('short_dca_trigger_price_pct', 1) or 0)
         if not enabled or trigger_pct <= 0:
             return False
-        count = int(data.get('dca_count', 0) or 0)
         if count >= max_steps:
             return False
         if time.time() - float(data.get('last_dca_time', 0) or 0) < min_gap:
@@ -4061,6 +4127,11 @@ class BaseBot:
         adverse_pct = ((reference_price - current_price) / reference_price * 100.0
                        if side == 'BUY' else (current_price - reference_price) / reference_price * 100.0)
         data['last_dca_adverse_pct'] = adverse_pct
+        data['next_dca_trigger_pct'] = trigger_pct
+        data['active_dca_strategy'] = dca_strategy
+        if dca_strategy == 'fibonacci':
+            # Tránh sai số float tại đúng mốc (ví dụ 14.999999999999988 thay vì 15.0).
+            return adverse_pct + 1e-9 >= trigger_pct
         return adverse_pct >= trigger_pct
 
     def _add_dca(self, symbol, current_price, roi=None):
@@ -4088,22 +4159,36 @@ class BaseBot:
                 data['initial_margin'] = initial_margin
 
             if side == 'BUY':
+                dca_strategy = str(_STRATEGY_CONFIG.get('long_dca_strategy', 'traditional') or 'traditional').lower()
                 order_multiplier = float(_STRATEGY_CONFIG.get('long_dca_order_multiplier', 1) or 0)
                 max_steps = int(_STRATEGY_CONFIG.get('long_max_dca_steps', 3) or 0)
                 cap_pct = float(_STRATEGY_CONFIG.get('long_max_total_margin_per_symbol_pct', 4) or 0)
                 side_notional_cap_pct = float(_STRATEGY_CONFIG.get('max_long_notional_pct', 100) or 0)
             else:
+                dca_strategy = str(_STRATEGY_CONFIG.get('short_dca_strategy', 'traditional') or 'traditional').lower()
                 order_multiplier = float(_STRATEGY_CONFIG.get('short_dca_order_multiplier', 1) or 0)
                 max_steps = int(_STRATEGY_CONFIG.get('short_max_dca_steps', 3) or 0)
                 cap_pct = float(_STRATEGY_CONFIG.get('short_max_total_margin_per_symbol_pct', 4) or 0)
                 side_notional_cap_pct = float(_STRATEGY_CONFIG.get('max_short_notional_pct', 100) or 0)
-            if count >= max_steps or order_multiplier <= 0:
-                return False
+
             last_order_margin = float(data.get('last_order_margin') or initial_margin or 0)
             if last_order_margin <= 0:
                 return False
-            # Yêu cầu: vốn DCA mới = vốn của LẦN VÀO GẦN NHẤT × hệ số.
-            add_margin = last_order_margin * order_multiplier
+
+            if dca_strategy == 'fibonacci':
+                max_steps = len(_FIBONACCI_DCA_SEQUENCE)
+                if count >= max_steps:
+                    return False
+                # Quan trọng: Fibonacci vốn dựa trên VỐN LỆNH BAN ĐẦU, không nhân dồn từ lần gần nhất.
+                # DCA1..5 = initial × 1, 2, 3, 5, 8.
+                order_multiplier = float(_FIBONACCI_DCA_SEQUENCE[count])
+                add_margin = initial_margin * order_multiplier
+            else:
+                if count >= max_steps or order_multiplier <= 0:
+                    return False
+                # Giữ NGUYÊN cơ chế truyền thống của file gốc:
+                # vốn DCA mới = vốn của LẦN VÀO GẦN NHẤT × hệ số.
+                add_margin = last_order_margin * order_multiplier
             _, available = get_total_and_available_balance(self.api_key, self.api_secret)
             margin_balance = get_margin_balance(self.api_key, self.api_secret)
             if margin_balance is None or available is None or add_margin <= 0:
@@ -4144,11 +4229,14 @@ class BaseBot:
             reference_price = float(data.get('last_dca_price') or data.get('initial_entry_price') or data.get('entry') or price)
             adverse_pct = ((reference_price - price) / reference_price * 100.0
                            if side == 'BUY' else (price - reference_price) / reference_price * 100.0)
+            trigger_pct = float(data.get('next_dca_trigger_pct') or 0)
+            event_reason = (f'mode={dca_strategy} adverse_price={adverse_pct:.6f}% '
+                            f'trigger={trigger_pct:.6f}% ref={reference_price:.12g} capital_x={order_multiplier:.6g}')
             event_ok = _LIVE_DB.add_event(
                 'DCA_REQUESTED', symbol, bot_id=self.bot_id, side=side, quantity=add_qty,
                 price=price, margin=add_margin, roi_pct=roi, dca_step=step_num,
-                reason=f'adverse_price={adverse_pct:.6f}% ref={reference_price:.12g}',
-                raw={'position': pos}, required=_LIVE_DB.required_for_new_orders,
+                reason=event_reason,
+                raw={'position': pos, 'dca_strategy': dca_strategy}, required=_LIVE_DB.required_for_new_orders,
             )
             if _LIVE_DB.required_for_new_orders and not event_ok:
                 return False
@@ -4197,11 +4285,16 @@ class BaseBot:
             _LIVE_DB.add_event('DCA_CONFIRMED', symbol, bot_id=self.bot_id, side=side,
                                quantity=add_qty, price=fill_price, margin=add_margin,
                                roi_pct=roi, dca_step=step_num,
-                               reason=f'adverse_price={adverse_pct:.6f}% ref={reference_price:.12g}',
-                               order_id=str(result.get('orderId')), raw={'order': result, 'position': new_pos if ok else None})
+                               reason=event_reason,
+                               order_id=str(result.get('orderId')), raw={'order': result, 'position': new_pos if ok else None,
+                                                                        'dca_strategy': dca_strategy})
             if not saved:
                 self.log(f'⚠️ DCA đã khớp nhưng chưa lưu được DB: {_LIVE_DB.last_error}')
-            self.log(f'➕ DCA LIVE {symbol} {side} bước {step_num}/{max_steps} | lệch={adverse_pct:.4f}% | ref={reference_price:.8g} fill={fill_price:.8g} | vốn gần nhất={last_order_margin:.4f} × {order_multiplier:.4f} = {add_margin:.4f}')
+            capital_base_text = (f'initial={initial_margin:.4f}' if dca_strategy == 'fibonacci'
+                                 else f'vốn gần nhất={last_order_margin:.4f}')
+            self.log(f'➕ DCA LIVE {symbol} {side} [{dca_strategy.upper()}] bước {step_num}/{max_steps} | '
+                     f'lệch={adverse_pct:.4f}% trigger={trigger_pct:.4f}% | ref={reference_price:.8g} fill={fill_price:.8g} | '
+                     f'{capital_base_text} × {order_multiplier:.4f} = {add_margin:.4f}')
             return True
 
     @staticmethod
@@ -4999,12 +5092,14 @@ class BotManager:
         dca_key_map = {
             '✏️ Nhồi BUY bật/tắt': ('enable_dca_long', '1 = bật nhồi BUY; 0 = tắt.'),
             '✏️ Nhồi SELL bật/tắt': ('enable_dca_short', '1 = bật nhồi SELL; 0 = tắt.'),
-            '✏️ Giá ngược BUY %': ('long_dca_trigger_price_pct', 'Giá giảm bao nhiêu % từ GIÁ KHỚP GẦN NHẤT thì nhồi BUY.'),
-            '✏️ Giá ngược SELL %': ('short_dca_trigger_price_pct', 'Giá tăng bao nhiêu % từ GIÁ KHỚP GẦN NHẤT thì nhồi SELL.'),
-            '✏️ Hệ số vốn BUY': ('long_dca_order_multiplier', 'Vốn nhồi BUY = vốn lần vào gần nhất × hệ số này. Ví dụ 1.5.'),
-            '✏️ Hệ số vốn SELL': ('short_dca_order_multiplier', 'Vốn nhồi SELL = vốn lần vào gần nhất × hệ số này. Ví dụ 1.5.'),
-            '✏️ Số lần nhồi BUY': ('long_max_dca_steps', 'Số lần nhồi BUY tối đa.'),
-            '✏️ Số lần nhồi SELL': ('short_max_dca_steps', 'Số lần nhồi SELL tối đa.'),
+            '✏️ Kiểu nhồi BUY': ('long_dca_strategy', 'traditional = logic gốc; fibonacci = giá Fib×5 và vốn Fib×1.'),
+            '✏️ Kiểu nhồi SELL': ('short_dca_strategy', 'traditional = logic gốc; fibonacci = giá Fib×5 và vốn Fib×1.'),
+            '✏️ Giá ngược BUY %': ('long_dca_trigger_price_pct', 'Chỉ dùng ở traditional. Giá giảm bao nhiêu % từ GIÁ KHỚP GẦN NHẤT thì nhồi BUY.'),
+            '✏️ Giá ngược SELL %': ('short_dca_trigger_price_pct', 'Chỉ dùng ở traditional. Giá tăng bao nhiêu % từ GIÁ KHỚP GẦN NHẤT thì nhồi SELL.'),
+            '✏️ Hệ số vốn BUY': ('long_dca_order_multiplier', 'Chỉ dùng ở traditional. Vốn nhồi BUY = vốn lần vào gần nhất × hệ số này. Ví dụ 1.5.'),
+            '✏️ Hệ số vốn SELL': ('short_dca_order_multiplier', 'Chỉ dùng ở traditional. Vốn nhồi SELL = vốn lần vào gần nhất × hệ số này. Ví dụ 1.5.'),
+            '✏️ Số lần nhồi BUY': ('long_max_dca_steps', 'Chỉ dùng ở traditional. Fibonacci cố định tối đa 5 lần.'),
+            '✏️ Số lần nhồi SELL': ('short_max_dca_steps', 'Chỉ dùng ở traditional. Fibonacci cố định tối đa 5 lần.'),
             '✏️ Giãn cách nhồi BUY': ('long_dca_min_seconds_between_adds', 'Số giây tối thiểu giữa hai lần nhồi BUY.'),
             '✏️ Giãn cách nhồi SELL': ('short_dca_min_seconds_between_adds', 'Số giây tối thiểu giữa hai lần nhồi SELL.'),
         }
@@ -5261,8 +5356,11 @@ class BotManager:
             if text in mapping:
                 key, help_text = mapping[text]
                 self.user_states[chat_id] = {'step': value_step, 'strategy_key': key}
+                value_keyboard = (create_dca_strategy_keyboard()
+                                  if key in {'long_dca_strategy', 'short_dca_strategy'}
+                                  else create_management_value_keyboard())
                 send_telegram(f'✏️ Nhập giá trị mới cho <b>{key}</b>\n{help_text}', chat_id=chat_id,
-                             reply_markup=create_management_value_keyboard(),
+                             reply_markup=value_keyboard,
                              bot_token=self.telegram_bot_token, default_chat_id=self.telegram_chat_id)
             else:
                 send_telegram('⚠️ Hãy chọn một tham số trong nhóm này.', chat_id=chat_id,
@@ -5369,6 +5467,8 @@ class BotManager:
                         raise ValueError('invalid interval')
                 elif key in StrategyConfig.STRING_KEYS:
                     val = raw.lower()
+                    if key in {'long_dca_strategy', 'short_dca_strategy'} and val not in {'traditional', 'fibonacci'}:
+                        raise ValueError('DCA strategy phải là traditional hoặc fibonacci')
                     if key in {'reverse_mode', 'long_reverse_mode', 'short_reverse_mode'} and val not in {'none','immediate','confirmed'}:
                         raise ValueError('reverse mode phải là none/immediate/confirmed')
                     if key in {'side_balance_mode', 'buy_side_balance_mode', 'sell_side_balance_mode'} and val not in {'filter','override'}:
