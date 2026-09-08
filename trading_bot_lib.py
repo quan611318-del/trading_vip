@@ -1412,8 +1412,8 @@ class StrategyConfig:
     Telegram và state cũ không bị lỗi.
     """
     DEFAULTS = {
-        'current_interval': '15m',
-        'signal_interval': '15m',
+        'current_interval': '5m',
+        'signal_interval': '5m',
         'timeframe_seconds': 900.0,
         'use_quote_volume': 1.0,
 
@@ -1421,11 +1421,11 @@ class StrategyConfig:
         'ema_fast_period': 9,
         'ema_slow_period': 21,
         'signal_volume_lookback': 20,
-        'buy_score_threshold': 6.0,
-        'sell_score_threshold': 6.5,
+        'buy_score_threshold': 1,
+        'sell_score_threshold': 1,
         'buy_min_score_gap': 1.0,
         'sell_min_score_gap': 0.4,
-        'buy_min_volume_ratio': 1.50,
+        'buy_min_volume_ratio': 1,
         'sell_min_volume_ratio': 1.10,
         'buy_min_body_pct': 0.15,
         'sell_min_body_pct': 0.08,
@@ -1531,8 +1531,8 @@ class StrategyConfig:
 
         # Rủi ro tài khoản: có giới hạn tổng và giới hạn riêng BUY/SELL.
         'max_positions': 100,
-        'max_long_positions': 8,
-        'max_short_positions': 8,
+        'max_long_positions': 18,
+        'max_short_positions': 1,
         'long_max_total_margin_per_symbol_pct': 100.0,
         'short_max_total_margin_per_symbol_pct': 100.0,
         'max_total_margin_per_symbol_pct': 100.0,
@@ -1560,8 +1560,8 @@ class StrategyConfig:
 
         # Cooldown/runtime.
         'cooldown_after_close_seconds': 60,
-        'blacklist_after_tp_sl_seconds': 180,
-        'coin_cooldown_after_loss_sec': 180,
+        'blacklist_after_tp_sl_seconds': 1800,
+        'coin_cooldown_after_loss_sec': 1800,
         'max_hold_seconds': 0,
         'max_consecutive_losses_before_pause': 999,
         'pause_after_loss_streak_sec': 0,
