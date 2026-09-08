@@ -1402,8 +1402,8 @@ def _interval_seconds(interval=None):
 # - Khoảng giá: Fibonacci ×5 => 5%, 10%, 15%, 25%, 40% so với GIÁ KHỚP GẦN NHẤT.
 # - Vốn nhồi: Fibonacci ×1 => 1, 2, 3, 5, 8 lần VỐN LỆNH BAN ĐẦU.
 # Lệnh ban đầu không tính vào dca_count; vì vậy có đúng 5 bước DCA Fibonacci.
-_FIBONACCI_DCA_SEQUENCE = (1.0, 2.0, 3.0, 5.0, 8.0)
-_FIBONACCI_DCA_PRICE_SCALE = 5.0
+_FIBONACCI_DCA_SEQUENCE = (1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0)
+_FIBONACCI_DCA_PRICE_SCALE = 1.0
 
 class StrategyConfig:
     """Cấu hình LIVE EMA + volume, đồng bộ với bộ tham số của bản PostgreSQL.
